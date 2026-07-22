@@ -4,6 +4,7 @@ from __future__ import annotations
 from homeassistant.components.sensor import SensorEntity
 from homeassistant.components.switch import SwitchEntity
 from homeassistant.core import HomeAssistant
+from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.typing import ConfigType, DiscoveryInfoType
 from typing import Any, Final, Literal, TypedDict, final
@@ -61,9 +62,19 @@ class CozyLifeSwitch(SwitchEntity):
         self._name = tcp_client.device_model_name + ' ' + tcp_client.device_id[-4:]
         self._refresh_state()
     
-    def _refresh_state(self):
+    def _refresh_state(self) -> None:
+        """Refresh state, marking the switch unavailable without switch data."""
         self._state = self._tcp_client.query()
+        if '1' not in self._state:
+            self._attr_available = False
+            return
+
+        self._attr_available = True
         self._attr_is_on = 0 != self._state['1']
+
+    def update(self) -> None:
+        """Poll the device so an unavailable switch can recover."""
+        self._refresh_state()
     
     @property
     def name(self) -> str:
@@ -72,14 +83,11 @@ class CozyLifeSwitch(SwitchEntity):
     @property
     def available(self) -> bool:
         """Return if the device is available."""
-        return True
+        return self._attr_available
     
     @property
     def is_on(self) -> bool:
         """Return True if entity is on."""
-        self._attr_is_on = True
-
-        self._refresh_state()
         return self._attr_is_on
     
     @property
@@ -89,17 +97,25 @@ class CozyLifeSwitch(SwitchEntity):
     
     def turn_on(self, **kwargs: Any) -> None:
         """Turn the entity on."""
-        self._attr_is_on = True
         _LOGGER.info(f'turn_on:{kwargs}')
-        self._tcp_client.control({'1': 255})
+        if not self._tcp_client.control({'1': 255}):
+            self._attr_available = False
+            self.schedule_update_ha_state()
+            raise HomeAssistantError("Unable to send command to CozyLife device")
+        self._attr_available = True
+        self._attr_is_on = True
         return None
         raise NotImplementedError()
     
     def turn_off(self, **kwargs: Any) -> None:
         """Turn the entity off."""
-        self._attr_is_on = False
         _LOGGER.info('turn_off')
-        self._tcp_client.control({'1': 0})
+        if not self._tcp_client.control({'1': 0}):
+            self._attr_available = False
+            self.schedule_update_ha_state()
+            raise HomeAssistantError("Unable to send command to CozyLife device")
+        self._attr_available = True
+        self._attr_is_on = False
         return None
         
         raise NotImplementedError()
