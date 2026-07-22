@@ -175,6 +175,8 @@ def _make_client(connection) -> tcp_client:
     client._io_lock = threading.RLock()
     client._reconnect_thread = None
     client._last_sequence_number = None
+    client._ready = False
+    client._ready_callbacks = []
     client._device_id = str
     client._pid = str
     client._device_type_code = str
@@ -354,6 +356,133 @@ class TransmissionControlProtocolFailureTest(unittest.TestCase):
         self.assertTrue(invalid_socket.closed)
         self.assertIs(client._connect, valid_socket)
         sleep.assert_called_once_with(60)
+
+    def test_ready_callback_runs_once_after_handshake_outside_lock(self) -> None:
+        """A successful handshake publishes readiness once without holding I/O."""
+        with patch.object(tcp_client, "_reconnect"):
+            client = tcp_client("192.0.2.1")
+        transaction_lock = TrackingRLock()
+        client._io_lock = transaction_lock
+        callback_clients: list[tcp_client] = []
+        callback_lock_depths: list[int] = []
+        register_callback = getattr(client, "add_ready_callback", None)
+        self.assertTrue(callable(register_callback))
+        register_callback(
+            lambda ready_client: (
+                callback_clients.append(ready_client),
+                callback_lock_depths.append(transaction_lock.depth),
+            )
+        )
+        workers: list[DormantThread] = []
+
+        def create_thread(*, target) -> DormantThread:
+            worker = DormantThread(target)
+            workers.append(worker)
+            return worker
+
+        sockets = [
+            CandidateSocket(_valid_device_information_response("1000")),
+            CandidateSocket(_valid_device_information_response("1001")),
+        ]
+        with patch(
+            "custom_components.hass_cozylife_local_pull.tcp_client.threading.Thread",
+            side_effect=create_thread,
+        ), patch(
+            "custom_components.hass_cozylife_local_pull.tcp_client.socket.socket",
+            side_effect=sockets,
+        ), patch(
+            "custom_components.hass_cozylife_local_pull.tcp_client.get_pid_list",
+            return_value=[],
+        ), patch(
+            "custom_components.hass_cozylife_local_pull.tcp_client.get_sn",
+            return_value="1000",
+        ):
+            client._reconnect()
+            workers.pop(0).target()
+            client._reconnect()
+            workers.pop(0).target()
+
+        self.assertEqual(callback_clients, [client])
+        self.assertEqual(callback_lock_depths, [0])
+
+    def test_ready_callback_registered_after_handshake_runs_immediately(self) -> None:
+        """Platform registration cannot miss an already completed handshake."""
+        with patch.object(tcp_client, "_reconnect"):
+            client = tcp_client("192.0.2.1")
+        workers: list[DormantThread] = []
+
+        def create_thread(*, target) -> DormantThread:
+            worker = DormantThread(target)
+            workers.append(worker)
+            return worker
+
+        with patch(
+            "custom_components.hass_cozylife_local_pull.tcp_client.threading.Thread",
+            side_effect=create_thread,
+        ), patch(
+            "custom_components.hass_cozylife_local_pull.tcp_client.socket.socket",
+            return_value=CandidateSocket(
+                _valid_device_information_response("1000")
+            ),
+        ), patch(
+            "custom_components.hass_cozylife_local_pull.tcp_client.get_pid_list",
+            return_value=[],
+        ), patch(
+            "custom_components.hass_cozylife_local_pull.tcp_client.get_sn",
+            return_value="1000",
+        ):
+            client._reconnect()
+            workers[0].target()
+
+        callback_clients: list[tcp_client] = []
+        register_callback = getattr(client, "add_ready_callback", None)
+        self.assertTrue(callable(register_callback))
+        register_callback(callback_clients.append)
+
+        self.assertEqual(callback_clients, [client])
+
+    def test_failing_ready_callback_does_not_block_other_callbacks(self) -> None:
+        """A platform callback failure cannot invalidate a ready connection."""
+        with patch.object(tcp_client, "_reconnect"):
+            client = tcp_client("192.0.2.1")
+        callback_clients: list[tcp_client] = []
+        register_callback = getattr(client, "add_ready_callback", None)
+        self.assertTrue(callable(register_callback))
+
+        def fail_callback(ready_client: tcp_client) -> None:
+            raise RuntimeError("Injected callback failure")
+
+        register_callback(fail_callback)
+        register_callback(callback_clients.append)
+        workers: list[DormantThread] = []
+
+        def create_thread(*, target) -> DormantThread:
+            worker = DormantThread(target)
+            workers.append(worker)
+            return worker
+
+        ready_socket = CandidateSocket(_valid_device_information_response("1000"))
+        with patch(
+            "custom_components.hass_cozylife_local_pull.tcp_client.threading.Thread",
+            side_effect=create_thread,
+        ), patch(
+            "custom_components.hass_cozylife_local_pull.tcp_client.socket.socket",
+            return_value=ready_socket,
+        ), patch(
+            "custom_components.hass_cozylife_local_pull.tcp_client.get_pid_list",
+            return_value=[],
+        ), patch(
+            "custom_components.hass_cozylife_local_pull.tcp_client.get_sn",
+            return_value="1000",
+        ), self.assertLogs(
+            "custom_components.hass_cozylife_local_pull.tcp_client", level="ERROR"
+        ):
+            client._reconnect()
+            workers[0].target()
+
+        self.assertEqual(callback_clients, [client])
+        self.assertIs(client._connect, ready_socket)
+        self.assertFalse(ready_socket.closed)
 
     def test_completed_worker_allows_immediate_reconnect(self) -> None:
         """A completed target does not hide behind a still-alive thread object."""

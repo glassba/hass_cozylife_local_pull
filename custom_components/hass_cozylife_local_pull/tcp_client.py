@@ -2,7 +2,7 @@
 import json
 import socket
 import time
-from typing import Optional, Union, Any
+from typing import Callable, Optional, Union, Any
 import logging
 from .utils import get_pid_list, get_sn
 import threading
@@ -52,6 +52,8 @@ class tcp_client(object):
         self._io_lock = threading.RLock()
         self._reconnect_thread = None
         self._last_sequence_number = None
+        self._ready = False
+        self._ready_callbacks: list[Callable[["tcp_client"], None]] = []
         self._close_connection() 
         self._reconnect()
     
@@ -65,6 +67,37 @@ class tcp_client(object):
                     _LOGGER.error(f'Error while closing the connection: {e}')
                 self._connect = None
             self._receive_buffer = b''
+
+    def add_ready_callback(
+        self, callback: Callable[["tcp_client"], None]
+    ) -> None:
+        """Run a callback once the first device handshake has completed."""
+        with self._io_lock:
+            if not self._ready:
+                self._ready_callbacks.append(callback)
+                return
+
+        self._run_ready_callback(callback)
+
+    def _publish_ready(self) -> None:
+        """Publish first readiness outside the network transaction lock."""
+        with self._io_lock:
+            if self._ready:
+                return
+            self._ready = True
+            callbacks, self._ready_callbacks = self._ready_callbacks, []
+
+        for callback in callbacks:
+            self._run_ready_callback(callback)
+
+    def _run_ready_callback(
+        self, callback: Callable[["tcp_client"], None]
+    ) -> None:
+        """Keep platform callback failures from invalidating the connection."""
+        try:
+            callback(self)
+        except Exception:
+            _LOGGER.exception('Ready callback failed for %s', self._ip)
         
     def _reconnect(self):
         """Start one connection recovery worker for this device."""
@@ -85,6 +118,7 @@ class tcp_client(object):
                             )
                         if self._reconnect_thread is thread:
                             self._reconnect_thread = None
+                    self._publish_ready()
                     return
                 except Exception as e:
                     with self._io_lock:

@@ -60,12 +60,13 @@ def setup_platform(
     if discovery_info is None:
         return
     
-    lights = []
-    for item in hass.data[DOMAIN]['tcp_client']:
+    def add_ready_light(item: tcp_client) -> None:
+        """Add a light when its device information becomes available."""
         if LIGHT_TYPE_CODE == item.device_type_code:
-            lights.append(CozyLifeLight(item))
-    
-    add_entities(lights)
+            add_entities([CozyLifeLight(item)])
+
+    for item in hass.data[DOMAIN]['tcp_client']:
+        item.add_ready_callback(add_ready_light)
 
 
 class CozyLifeLight(LightEntity):

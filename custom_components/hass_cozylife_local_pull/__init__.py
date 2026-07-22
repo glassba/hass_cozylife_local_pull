@@ -5,7 +5,6 @@ from homeassistant.core import HomeAssistant
 from homeassistant.helpers.discovery import async_load_platform
 from homeassistant.helpers.typing import ConfigType
 import logging
-import time
 from .const import (
     DOMAIN,
     LANG
@@ -45,9 +44,6 @@ def setup(hass: HomeAssistant, config: ConfigType) -> bool:
         'tcp_client': [tcp_client(item) for item in ip_list],
     }
 
-    #wait for get device info from tcp conncetion
-    #but it is bad
-    time.sleep(3)
     # _LOGGER.info('setup', hass, config)
     # hass.helpers.discovery.load_platform('sensor', DOMAIN, {}, config)
     hass.loop.call_soon_threadsafe(hass.async_create_task, async_load_platform(hass, 'light', DOMAIN, {}, config))

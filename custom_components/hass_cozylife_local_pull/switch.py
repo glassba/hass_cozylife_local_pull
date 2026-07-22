@@ -42,12 +42,13 @@ def setup_platform(
         return
 
 
-    switchs = []
-    for item in hass.data[DOMAIN]['tcp_client']:
+    def add_ready_switch(item) -> None:
+        """Add a switch when its device information becomes available."""
         if SWITCH_TYPE_CODE == item.device_type_code:
-            switchs.append(CozyLifeSwitch(item))
-    
-    add_entities(switchs)
+            add_entities([CozyLifeSwitch(item)])
+
+    for item in hass.data[DOMAIN]['tcp_client']:
+        item.add_ready_callback(add_ready_switch)
 
 
 class CozyLifeSwitch(SwitchEntity):
