@@ -118,7 +118,7 @@ class LightColorModeTest(unittest.TestCase):
             "custom_components.hass_cozylife_local_pull.light"
         )
         client = FakeTcpClient(
-            [1, 3, 4, 5, 6],
+            [1, 2, 3, 4, 5, 6],
             {"1": 255, "3": 300, "4": 400, "5": 120, "6": 500},
         )
         entity = light.CozyLifeLight(client)
@@ -193,6 +193,48 @@ class LightColorModeTest(unittest.TestCase):
         self.assertIsNone(entity.hs_color)
 
 
+class LightWorkModeTest(unittest.TestCase):
+    """Verify work mode changes only accompany supported static controls."""
+
+    def test_plain_turn_on_preserves_work_mode(self) -> None:
+        """A plain turn-on command does not force the light into static mode."""
+        light = importlib.import_module(
+            "custom_components.hass_cozylife_local_pull.light"
+        )
+        client = FakeTcpClient([1, 2, 4], {"1": 0, "4": 0})
+        entity = light.CozyLifeLight(client)
+
+        entity.turn_on()
+
+        self.assertEqual(client.last_payload, {"1": 255})
+
+    def test_brightness_control_sets_supported_work_mode(self) -> None:
+        """A brightness command selects static mode when DPID 2 is supported."""
+        light = importlib.import_module(
+            "custom_components.hass_cozylife_local_pull.light"
+        )
+        client = FakeTcpClient([1, 2, 4], {"1": 0, "4": 0})
+        entity = light.CozyLifeLight(client)
+
+        entity.turn_on(**{light.ATTR_BRIGHTNESS: 128})
+
+        self.assertEqual(
+            client.last_payload, {"1": 255, "2": 0, "4": 512}
+        )
+
+    def test_static_control_omits_unsupported_work_mode(self) -> None:
+        """A light without DPID 2 receives only its supported static values."""
+        light = importlib.import_module(
+            "custom_components.hass_cozylife_local_pull.light"
+        )
+        client = FakeTcpClient([1, 4], {"1": 0, "4": 0})
+        entity = light.CozyLifeLight(client)
+
+        entity.turn_on(**{light.ATTR_BRIGHTNESS: 128})
+
+        self.assertEqual(client.last_payload, {"1": 255, "4": 512})
+
+
 class LightColorTemperatureTest(unittest.TestCase):
     """Verify color temperatures cross the device boundary in correct units."""
 
@@ -213,7 +255,7 @@ class LightColorTemperatureTest(unittest.TestCase):
             "custom_components.hass_cozylife_local_pull.light"
         )
         client = FakeTcpClient(
-            [1, 3, 4], {"1": 255, "3": 300, "4": 400}
+            [1, 2, 3, 4], {"1": 255, "3": 300, "4": 400}
         )
         entity = light.CozyLifeLight(client)
 
@@ -228,7 +270,7 @@ class LightColorTemperatureTest(unittest.TestCase):
             "custom_components.hass_cozylife_local_pull.light"
         )
         client = FakeTcpClient(
-            [1, 3, 4], {"1": 255, "3": 300, "4": 400}
+            [1, 2, 3, 4], {"1": 255, "3": 300, "4": 400}
         )
         entity = light.CozyLifeLight(client)
 

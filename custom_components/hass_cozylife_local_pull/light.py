@@ -185,7 +185,14 @@ class CozyLifeLight(LightEntity):
         effect = kwargs.get(ATTR_EFFECT)
         _LOGGER.info(f'turn_on.kwargs={kwargs}')
         
-        payload = {'1': 255, '2': 0}
+        payload = {'1': 255}
+        static_control_requested = any(
+            value is not None
+            for value in (brightness, color_temp_kelvin, hs_color)
+        )
+        # Preserve the current effect on plain turn-on and unsupported models.
+        if 2 in self._tcp_client.dpid and static_control_requested:
+            payload['2'] = 0
         if brightness is not None:
             payload['4'] = brightness * 4
         
