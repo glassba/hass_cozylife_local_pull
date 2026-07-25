@@ -35,7 +35,8 @@ from .const import (
     HUE,
     SAT,
 )
-from .tcp_client import tcp_client
+from .tcp_client import DeviceCommandRejectedError, tcp_client
+from . import register_client_callback
 import logging
 from homeassistant.components import zeroconf
 
@@ -65,8 +66,11 @@ def setup_platform(
         if LIGHT_TYPE_CODE == item.device_type_code:
             add_entities([CozyLifeLight(item)])
 
-    for item in hass.data[DOMAIN]['tcp_client']:
+    def register_client(item: tcp_client) -> None:
+        """Attach the light readiness callback to one network client."""
         item.add_ready_callback(add_ready_light)
+
+    register_client_callback(hass, register_client)
 
 
 class CozyLifeLight(LightEntity):
@@ -195,7 +199,14 @@ class CozyLifeLight(LightEntity):
             )
             payload['3'] = 1000 - color_temp_mired * 2
         
-        if not self._tcp_client.control(payload):
+        try:
+            control_succeeded = self._tcp_client.control(payload)
+        except DeviceCommandRejectedError as err:
+            raise HomeAssistantError(
+                "CozyLife device rejected command"
+            ) from err
+
+        if not control_succeeded:
             self._attr_available = False
             self.schedule_update_ha_state()
             raise HomeAssistantError("Unable to send command to CozyLife device")
@@ -216,7 +227,14 @@ class CozyLifeLight(LightEntity):
     def turn_off(self, **kwargs: Any) -> None:
         """Turn the entity off."""
         _LOGGER.info(f'turn_off.kwargs={kwargs}')
-        if not self._tcp_client.control({'1': 0}):
+        try:
+            control_succeeded = self._tcp_client.control({'1': 0})
+        except DeviceCommandRejectedError as err:
+            raise HomeAssistantError(
+                "CozyLife device rejected command"
+            ) from err
+
+        if not control_succeeded:
             self._attr_available = False
             self.schedule_update_ha_state()
             raise HomeAssistantError("Unable to send command to CozyLife device")

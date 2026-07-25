@@ -5,6 +5,7 @@ import time
 from typing import Callable, Optional, Union, Any
 import logging
 from .utils import get_pid_list, get_sn
+from .const import LANG
 import threading
 
 CMD_INFO = 0
@@ -14,6 +15,10 @@ CMD_LIST = [CMD_INFO, CMD_QUERY, CMD_SET]
 RESPONSE_TIMEOUT_SECONDS = 3
 MAX_FRAME_SIZE_BYTES = 64 * 1024
 _LOGGER = logging.getLogger(__name__)
+
+
+class DeviceCommandRejectedError(Exception):
+    """Report a valid device rejection without invalidating its connection."""
 
 
 class tcp_client(object):
@@ -45,34 +50,104 @@ class tcp_client(object):
     _dpid = []
     _last_sequence_number: Optional[int] = None
     
-    def __init__(self, ip):
+    def __init__(self, ip, lang: str = LANG):
         self._ip = ip
+        self._lang = lang
         self._connect = None  # Initialize _connect as None
+        self._connecting_socket = None
         self._receive_buffer = b''
+        self._connect_phase_lock = threading.Lock()
         self._io_lock = threading.RLock()
+        self._lifecycle_lock = threading.RLock()
+        self._ready_callback_lock = threading.RLock()
         self._reconnect_thread = None
+        self._stop_event = threading.Event()
         self._last_sequence_number = None
         self._ready = False
         self._ready_callbacks: list[Callable[["tcp_client"], None]] = []
         self._close_connection() 
         self._reconnect()
     
+    def _interrupt_socket(self, connection) -> None:
+        """Interrupt blocking socket work before releasing its resources."""
+        if connection is None:
+            return
+        try:
+            connection.shutdown(socket.SHUT_RDWR)
+        except (AttributeError, OSError):
+            pass
+        try:
+            connection.close()
+        except Exception as err:
+            _LOGGER.error('Error while closing the connection: %s', err)
+
     def _close_connection(self):
         """Close the active socket and discard connection-specific fragments."""
         with self._io_lock:
-            if self._connect:
-                try:
-                    self._connect.close()
-                except Exception as e:
-                    _LOGGER.error(f'Error while closing the connection: {e}')
+            with self._lifecycle_lock:
+                connection = self._connect
                 self._connect = None
+            if connection:
+                self._interrupt_socket(connection)
             self._receive_buffer = b''
+
+    def signal_stop(self) -> None:
+        """Prevent new work without waiting for admitted operations."""
+        self._stop_event.set()
+
+    def request_stop(self) -> None:
+        """Prevent new work and wait for admitted operations to finish."""
+        self.signal_stop()
+        # Wait for a socket connection admitted before stop publication.
+        with self._connect_phase_lock:
+            pass
+        # Wait for network work admitted under the lifecycle lock to finish.
+        with self._lifecycle_lock:
+            pass
+        # Wait for the complete send/receive transaction to leave the I/O lock.
+        with self._io_lock:
+            pass
+        # Do not return while a callback that passed its stop check can run.
+        with self._ready_callback_lock:
+            pass
+
+    def close(self) -> None:
+        """Stop connection recovery and release the active socket."""
+        self.signal_stop()
+        with self._lifecycle_lock:
+            connecting_socket = self._connecting_socket
+            active_socket = self._connect
+            worker = self._reconnect_thread
+
+        # Interrupt sockets before taking the transaction lock so blocked I/O
+        # can release the worker that owns it.
+        self._interrupt_socket(connecting_socket)
+        if active_socket is not connecting_socket:
+            self._interrupt_socket(active_socket)
+
+        self.request_stop()
+
+        if worker is not None and worker is not threading.current_thread():
+            worker.join(RESPONSE_TIMEOUT_SECONDS)
+            if worker.is_alive():
+                _LOGGER.warning(
+                    'Reconnect worker did not stop for %s within timeout',
+                    self._ip,
+                )
+
+        with self._io_lock:
+            with self._lifecycle_lock:
+                self._connecting_socket = None
+            self._ready_callbacks = []
+            self._close_connection()
 
     def add_ready_callback(
         self, callback: Callable[["tcp_client"], None]
     ) -> None:
         """Run a callback once the first device handshake has completed."""
         with self._io_lock:
+            if self._stop_event.is_set():
+                return
             if not self._ready:
                 self._ready_callbacks.append(callback)
                 return
@@ -82,7 +157,7 @@ class tcp_client(object):
     def _publish_ready(self) -> None:
         """Publish first readiness outside the network transaction lock."""
         with self._io_lock:
-            if self._ready:
+            if self._stop_event.is_set() or self._ready:
                 return
             self._ready = True
             callbacks, self._ready_callbacks = self._ready_callbacks, []
@@ -94,57 +169,95 @@ class tcp_client(object):
         self, callback: Callable[["tcp_client"], None]
     ) -> None:
         """Keep platform callback failures from invalidating the connection."""
-        try:
-            callback(self)
-        except Exception:
-            _LOGGER.exception('Ready callback failed for %s', self._ip)
+        with self._ready_callback_lock:
+            if self._stop_event.is_set():
+                return
+            try:
+                callback(self)
+            except Exception:
+                _LOGGER.exception('Ready callback failed for %s', self._ip)
         
     def _reconnect(self):
         """Start one connection recovery worker for this device."""
         def reconnect_thread():
-            while True:
-                s = None
-                try:
-                    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                    s.settimeout(RESPONSE_TIMEOUT_SECONDS)
-                    s.connect((self._ip, self._port))
-                    with self._io_lock:
-                        self._close_connection()
-                        self._connect = s
-                        self._receive_buffer = b''
-                        if not self._device_info():
-                            raise ConnectionError(
-                                'Device information response is invalid'
-                            )
-                        if self._reconnect_thread is thread:
-                            self._reconnect_thread = None
-                    self._publish_ready()
-                    return
-                except Exception as e:
-                    with self._io_lock:
-                        if self._connect is s:
-                            self._close_connection()
-                        elif s is not None:
-                            try:
-                                s.close()
-                            except Exception as close_error:
-                                _LOGGER.error(
-                                    f'Error while closing reconnect socket: {close_error}'
+            try:
+                while not self._stop_event.is_set():
+                    retry_error = None
+                    publish_ready = False
+                    with self._connect_phase_lock:
+                        s = None
+                        try:
+                            with self._lifecycle_lock:
+                                if self._stop_event.is_set():
+                                    return
+                                s = socket.socket(
+                                    socket.AF_INET,
+                                    socket.SOCK_STREAM,
                                 )
-                    _LOGGER.info(f'Reconnection failed: {e}')
-                    time.sleep(60)  # Wait for 60 seconds before trying to reconnect
+                                s.settimeout(RESPONSE_TIMEOUT_SECONDS)
+                                self._connecting_socket = s
+                            s.connect((self._ip, self._port))
+                            with self._io_lock:
+                                self._close_connection()
+                                with self._lifecycle_lock:
+                                    stopped = self._stop_event.is_set()
+                                    if self._connecting_socket is s:
+                                        self._connecting_socket = None
+                                    if not stopped:
+                                        self._connect = s
+                                        self._receive_buffer = b''
 
-        with self._io_lock:
-            if (
-                self._reconnect_thread is not None
-                and self._reconnect_thread.is_alive()
-            ):
+                                if stopped:
+                                    self._interrupt_socket(s)
+                                    return
+                                # Keep the admitted handshake inside the stop
+                                # operation's complete I/O barrier.
+                                if not self._device_info():
+                                    raise ConnectionError(
+                                        'Device information response is invalid'
+                                    )
+                            with self._lifecycle_lock:
+                                if self._reconnect_thread is thread:
+                                    self._reconnect_thread = None
+                            publish_ready = True
+                        except Exception as err:
+                            with self._io_lock:
+                                with self._lifecycle_lock:
+                                    if self._connecting_socket is s:
+                                        self._connecting_socket = None
+                                    active_socket = self._connect is s
+                                if active_socket:
+                                    self._close_connection()
+                                elif s is not None:
+                                    self._interrupt_socket(s)
+                            retry_error = err
+
+                    # Readiness callbacks may perform I/O from this or another
+                    # thread, so release reconnect admission before dispatch.
+                    if publish_ready:
+                        self._publish_ready()
+                        return
+
+                    if retry_error is not None:
+                        _LOGGER.info(f'Reconnection failed: {retry_error}')
+                        if self._stop_event.wait(60):
+                            return
+            finally:
+                with self._lifecycle_lock:
+                    if self._reconnect_thread is thread:
+                        self._reconnect_thread = None
+
+        with self._lifecycle_lock:
+            if self._stop_event.is_set():
+                return
+            worker = self._reconnect_thread
+            if worker is not None and worker.is_alive():
                 return
 
             thread = threading.Thread(target=reconnect_thread)
             thread.daemon = True  # This makes the thread exit when the main program exits
-            self._reconnect_thread = thread
             thread.start()
+            self._reconnect_thread = thread
 
 
     @property
@@ -222,38 +335,57 @@ class tcp_client(object):
                     except OSError:
                         pass
         
-        if resp_json.get('msg') is None or type(resp_json['msg']) is not dict:
-            _LOGGER.info('_device_info.recv.error1')
-            
-            return False
-        
-        if resp_json['msg'].get('did') is None:
-            _LOGGER.info('_device_info.recv.error2')
-            
+        if (
+            type(resp_json.get('cmd')) is not int
+            or resp_json['cmd'] != CMD_INFO
+            or type(resp_json.get('res')) is not int
+            or resp_json['res'] != 0
+        ):
+            _LOGGER.info('_device_info.recv.protocol_error')
             return False
 
-        self._device_id = resp_json['msg']['did']
-        
-        if resp_json['msg'].get('pid') is None:
+        message = resp_json.get('msg')
+        if not isinstance(message, dict):
+            _LOGGER.info('_device_info.recv.error1')
+            return False
+
+        device_id = message.get('did')
+        if not isinstance(device_id, str) or not device_id:
+            _LOGGER.info('_device_info.recv.error2')
+            return False
+
+        product_id = message.get('pid')
+        if not isinstance(product_id, str) or not product_id:
             _LOGGER.info('_device_info.recv.error3')
             return False
-        
-        self._pid = resp_json['msg']['pid']        
-        pid_list = get_pid_list()
 
+        pid_list = get_pid_list(self._lang)
+        if not pid_list:
+            _LOGGER.info('_device_info.product_metadata.empty')
+            return False
+
+        product_metadata = None
+        device_type_code = None
         for item in pid_list:
-            match = False
             for item1 in item['m']:
-                if item1['pid'] == self._pid:
-                    match = True
-                    self._icon = item1['i']
-                    self._device_model_name = item1['n']
-                    self._dpid = item1['dpid']
+                if item1['pid'] == product_id:
+                    product_metadata = item1
+                    device_type_code = item['c']
                     break
-            
-            if match:
-                self._device_type_code = item['c']                
+
+            if product_metadata is not None:
                 break
+
+        if product_metadata is None:
+            _LOGGER.info('_device_info.product_metadata.unmapped')
+            return False
+
+        self._device_id = device_id
+        self._pid = product_id
+        self._device_type_code = device_type_code
+        self._icon = product_metadata['i']
+        self._device_model_name = product_metadata['n']
+        self._dpid = product_metadata['dpid']
         
         # _LOGGER.info(pid_list)
         _LOGGER.info(self._device_id)
@@ -310,27 +442,43 @@ class tcp_client(object):
     def _send_receiver(self, cmd: int, payload: dict) -> Union[dict, Any]:
         """Send a query, returning empty data while connection recovery starts."""
         with self._io_lock:
+            if self._stop_event.is_set():
+                return {}
             try:
-                response_deadline = time.monotonic() + RESPONSE_TIMEOUT_SECONDS
-                request_sequence_number = self._only_send(
-                    cmd, payload, response_deadline
-                )
+                # Synchronize the final stop check with request_stop before I/O.
+                with self._lifecycle_lock:
+                    if self._stop_event.is_set():
+                        return {}
+                    response_deadline = (
+                        time.monotonic() + RESPONSE_TIMEOUT_SECONDS
+                    )
+                    request_sequence_number = self._only_send(
+                        cmd, payload, response_deadline
+                    )
                 while time.monotonic() < response_deadline:
                     response = self._receive_message(response_deadline)
                     # Only accept the response for this request.
                     if response.get('sn') != request_sequence_number:
                         continue
 
-                    if len(response) == 0:
+                    if (
+                        type(response.get('cmd')) is not int
+                        or response['cmd'] != CMD_QUERY
+                        or type(response.get('res')) is not int
+                    ):
+                        raise ValueError('Query response is invalid')
+
+                    if response['res'] != 0:
                         return {}
 
-                    if response.get('msg') is None or type(response['msg']) is not dict:
-                        return {}
+                    message = response.get('msg')
+                    if (
+                        not isinstance(message, dict)
+                        or not isinstance(message.get('data'), dict)
+                    ):
+                        raise ValueError('Query response is invalid')
 
-                    if response['msg'].get('data') is None or type(response['msg']['data']) is not dict:
-                        return {}
-
-                    return response['msg']['data']
+                    return message['data']
 
                 raise TimeoutError('Timed out waiting for the query response')
 
@@ -358,17 +506,64 @@ class tcp_client(object):
             return request_sequence_number
     
     def control(self, payload: dict) -> bool:
-        """Send control data, returning False while connection recovery starts."""
+        """Send control data and require a matching device acknowledgement."""
         with self._io_lock:
+            if self._stop_event.is_set():
+                return False
             try:
-                self._only_send(CMD_SET, payload)
-            except (AttributeError, OSError) as err:
-                _LOGGER.info(f'control.send.error: {err}')
+                # Synchronize the final stop check with request_stop before I/O.
+                with self._lifecycle_lock:
+                    if self._stop_event.is_set():
+                        return False
+                    response_deadline = (
+                        time.monotonic() + RESPONSE_TIMEOUT_SECONDS
+                    )
+                    request_sequence_number = self._only_send(
+                        CMD_SET, payload, response_deadline
+                    )
+                while time.monotonic() < response_deadline:
+                    response = self._receive_message(response_deadline)
+                    if response.get('sn') != request_sequence_number:
+                        continue
+
+                    if (
+                        type(response.get('cmd')) is not int
+                        or response['cmd'] != CMD_SET
+                        or type(response.get('res')) is not int
+                    ):
+                        raise ValueError('Control acknowledgement is invalid')
+
+                    if response['res'] != 0:
+                        raise DeviceCommandRejectedError(
+                            f"Device rejected command with result {response['res']}"
+                        )
+
+                    message = response.get('msg')
+                    if (
+                        not isinstance(message, dict)
+                        or not isinstance(message.get('data'), dict)
+                        or message['data'] != payload
+                    ):
+                        raise ValueError('Control acknowledgement is invalid')
+
+                    return True
+
+                raise TimeoutError('Timed out waiting for the control response')
+            except DeviceCommandRejectedError:
+                raise
+            except Exception as err:
+                _LOGGER.info(f'control.error: {err}')
                 self._close_connection()
                 self._reconnect()
                 return False
+            finally:
+                if self._connect:
+                    try:
+                        self._connect.settimeout(RESPONSE_TIMEOUT_SECONDS)
+                    except OSError:
+                        pass
 
-        return True
+        return False
     
     def query(self) -> dict:
         """

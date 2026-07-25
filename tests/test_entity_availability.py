@@ -7,6 +7,9 @@ from unittest.mock import patch
 
 from custom_components.hass_cozylife_local_pull.light import CozyLifeLight
 from custom_components.hass_cozylife_local_pull.switch import CozyLifeSwitch
+from custom_components.hass_cozylife_local_pull.tcp_client import (
+    DeviceCommandRejectedError,
+)
 from homeassistant.exceptions import HomeAssistantError
 
 
@@ -106,6 +109,42 @@ class EntityAvailabilityTest(unittest.TestCase):
         entity.update()
         self.assertFalse(entity.is_on)
         self.assertFalse(entity.available)
+
+    def test_control_rejection_preserves_entity_availability(self) -> None:
+        """A device rejection reports failure without marking it offline."""
+        cases = (
+            (CozyLifeLight, {"1": 0, "4": 0}, "turn_on"),
+            (CozyLifeLight, {"1": 255, "4": 400}, "turn_off"),
+            (CozyLifeSwitch, {"1": 0}, "turn_on"),
+            (CozyLifeSwitch, {"1": 255}, "turn_off"),
+        )
+
+        for entity_type, state, command_name in cases:
+            with self.subTest(entity_type=entity_type, command=command_name):
+                client = SequencedDeviceClient([state.copy()])
+                entity = entity_type(client)
+                previous_is_on = entity.is_on
+                error = None
+
+                with patch.object(
+                    client,
+                    "control",
+                    side_effect=DeviceCommandRejectedError(
+                        "Device rejected command with result 1"
+                    ),
+                ), patch.object(
+                    entity, "schedule_update_ha_state"
+                ) as schedule:
+                    try:
+                        getattr(entity, command_name)()
+                    except Exception as err:
+                        error = err
+
+                self.assertIsInstance(error, HomeAssistantError)
+                self.assertIn("rejected", str(error).lower())
+                self.assertTrue(entity.available)
+                self.assertEqual(entity.is_on, previous_is_on)
+                schedule.assert_not_called()
 
     def test_control_failure_marks_entities_unavailable(self) -> None:
         """Failed light and switch commands report a Home Assistant error."""

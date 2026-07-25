@@ -42,6 +42,20 @@ VALID_INFO_RESPONSE = {
     "res": 0,
 }
 
+VALID_PID_LIST = [
+    {
+        "c": "01",
+        "m": [
+            {
+                "pid": VALID_INFO_RESPONSE["msg"]["pid"],
+                "i": "mdi:lightbulb",
+                "n": "Test Device",
+                "dpid": [1, 4],
+            }
+        ],
+    }
+]
+
 
 def _frame(obj: dict) -> bytes:
     """Encode a single protocol message exactly as _get_package does."""
@@ -234,12 +248,9 @@ class ObservableRLock:
 
 def _make_client(connection) -> tcp_client:
     """Create a transport client with production synchronization state."""
-    client = object.__new__(tcp_client)
+    with patch.object(tcp_client, "_reconnect"):
+        client = tcp_client("192.0.2.1")
     client._connect = connection
-    client._receive_buffer = b""
-    client._io_lock = threading.RLock()
-    client._reconnect_thread = None
-    client._last_sequence_number = None
     return client
 
 
@@ -262,7 +273,7 @@ class TransmissionControlProtocolMessageBoundaryTest(unittest.TestCase):
 
         with patch(
             "custom_components.hass_cozylife_local_pull.tcp_client.get_pid_list",
-            return_value=[],
+            return_value=VALID_PID_LIST,
         ), patch(
             "custom_components.hass_cozylife_local_pull.tcp_client.get_sn",
             return_value=VALID_INFO_RESPONSE["sn"],
@@ -286,7 +297,7 @@ class TransmissionControlProtocolMessageBoundaryTest(unittest.TestCase):
 
         with patch(
             "custom_components.hass_cozylife_local_pull.tcp_client.get_pid_list",
-            return_value=[],
+            return_value=VALID_PID_LIST,
         ), patch(
             "custom_components.hass_cozylife_local_pull.tcp_client.get_sn",
             return_value=VALID_INFO_RESPONSE["sn"],
@@ -318,7 +329,7 @@ class TransmissionControlProtocolMessageBoundaryTest(unittest.TestCase):
 
         with patch(
             "custom_components.hass_cozylife_local_pull.tcp_client.get_pid_list",
-            return_value=[],
+            return_value=VALID_PID_LIST,
         ), patch(
             "custom_components.hass_cozylife_local_pull.tcp_client.get_sn",
             return_value=VALID_INFO_RESPONSE["sn"],
@@ -350,7 +361,7 @@ class TransmissionControlProtocolMessageBoundaryTest(unittest.TestCase):
 
         with patch(
             "custom_components.hass_cozylife_local_pull.tcp_client.get_pid_list",
-            return_value=[],
+            return_value=VALID_PID_LIST,
         ), patch(
             "custom_components.hass_cozylife_local_pull.tcp_client.get_sn",
             return_value=VALID_INFO_RESPONSE["sn"],

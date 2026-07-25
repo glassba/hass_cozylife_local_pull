@@ -20,7 +20,9 @@ from .const import (
     HUE,
     SAT,
 )
+from .tcp_client import DeviceCommandRejectedError
 import logging
+from . import register_client_callback
 
 _LOGGER = logging.getLogger(__name__)
 _LOGGER.info('switch')
@@ -47,8 +49,11 @@ def setup_platform(
         if SWITCH_TYPE_CODE == item.device_type_code:
             add_entities([CozyLifeSwitch(item)])
 
-    for item in hass.data[DOMAIN]['tcp_client']:
+    def register_client(item) -> None:
+        """Attach the switch readiness callback to one network client."""
         item.add_ready_callback(add_ready_switch)
+
+    register_client_callback(hass, register_client)
 
 
 class CozyLifeSwitch(SwitchEntity):
@@ -99,7 +104,14 @@ class CozyLifeSwitch(SwitchEntity):
     def turn_on(self, **kwargs: Any) -> None:
         """Turn the entity on."""
         _LOGGER.info(f'turn_on:{kwargs}')
-        if not self._tcp_client.control({'1': 255}):
+        try:
+            control_succeeded = self._tcp_client.control({'1': 255})
+        except DeviceCommandRejectedError as err:
+            raise HomeAssistantError(
+                "CozyLife device rejected command"
+            ) from err
+
+        if not control_succeeded:
             self._attr_available = False
             self.schedule_update_ha_state()
             raise HomeAssistantError("Unable to send command to CozyLife device")
@@ -111,7 +123,14 @@ class CozyLifeSwitch(SwitchEntity):
     def turn_off(self, **kwargs: Any) -> None:
         """Turn the entity off."""
         _LOGGER.info('turn_off')
-        if not self._tcp_client.control({'1': 0}):
+        try:
+            control_succeeded = self._tcp_client.control({'1': 0})
+        except DeviceCommandRejectedError as err:
+            raise HomeAssistantError(
+                "CozyLife device rejected command"
+            ) from err
+
+        if not control_succeeded:
             self._attr_available = False
             self.schedule_update_ha_state()
             raise HomeAssistantError("Unable to send command to CozyLife device")
