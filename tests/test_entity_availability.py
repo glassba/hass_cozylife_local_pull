@@ -8,6 +8,9 @@ import unittest
 from unittest.mock import patch
 
 from custom_components.hass_cozylife_local_pull.light import CozyLifeLight
+from custom_components.hass_cozylife_local_pull.motor import (
+    CozyLifeMotorSwitch,
+)
 from custom_components.hass_cozylife_local_pull.switch import CozyLifeSwitch
 from custom_components.hass_cozylife_local_pull.tcp_client import (
     DeviceCommandRejectedError,
@@ -28,6 +31,7 @@ class SequencedDeviceClient:
         self._states = states.copy()
         self._control_result = control_result
         self.query_count = 0
+        self.last_payload: dict[str, int] | None = None
         self.state_callbacks = []
         self.last_state_sequence_number = 1699999999999
 
@@ -41,6 +45,7 @@ class SequencedDeviceClient:
 
     def control(self, payload: dict[str, int]) -> bool:
         """Return the configured control result."""
+        self.last_payload = payload.copy()
         if self._control_result:
             self.report(payload)
         return self._control_result
@@ -200,6 +205,46 @@ class EntityAvailabilityTest(unittest.IsolatedAsyncioTestCase):
         entity.update()
         self.assertFalse(entity.is_on)
         self.assertFalse(entity.available)
+
+    async def test_switch_variants_use_their_protocol_on_values(self) -> None:
+        """Ordinary switches and motors send their own DPID 1 on value."""
+        cases = (
+            (CozyLifeSwitch, 255),
+            (CozyLifeMotorSwitch, 1),
+        )
+
+        for entity_type, expected_on_value in cases:
+            with self.subTest(entity_type=entity_type):
+                client = SequencedDeviceClient([{"1": 0}])
+                entity = entity_type(client)
+                entity.hass = FakeHomeAssistant(asyncio.get_running_loop())
+
+                await entity.async_turn_on()
+                self.assertEqual(
+                    client.last_payload, {"1": expected_on_value}
+                )
+
+                await entity.async_turn_off()
+                self.assertEqual(client.last_payload, {"1": 0})
+
+    async def test_motor_switch_maps_nonzero_reports_to_started(self) -> None:
+        """DPID 1 values 1 through 3 all represent a non-stopped motor."""
+        client = SequencedDeviceClient([{"1": 0}])
+        entity = CozyLifeMotorSwitch(client)
+        entity.hass = FakeHomeAssistant(asyncio.get_running_loop())
+        await entity.async_added_to_hass()
+
+        with patch.object(entity, "async_write_ha_state") as write_state:
+            for value in (1, 2, 3):
+                client.report({"1": value})
+                await asyncio.sleep(0)
+                self.assertTrue(entity.is_on)
+
+            client.report({"1": 0})
+            await asyncio.sleep(0)
+
+        self.assertFalse(entity.is_on)
+        self.assertEqual(write_state.call_count, 4)
 
     async def test_control_rejection_preserves_entity_availability(self) -> None:
         """A device rejection reports failure without marking it offline."""

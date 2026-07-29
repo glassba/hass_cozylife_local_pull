@@ -224,6 +224,27 @@ class CountdownDeviceVariantTest(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(client.last_query_attributes, [int(dp_id)])
                 self.assertEqual(entity.native_value, 60)
 
+    async def test_motor_countdown_queries_and_controls_dpid_6(self) -> None:
+        """The motor subclass binds all countdown input and output to DPID 6."""
+        motor = importlib.import_module(
+            "custom_components.hass_cozylife_local_pull.motor"
+        )
+        number = importlib.import_module(
+            "custom_components.hass_cozylife_local_pull.number"
+        )
+        client = FakeTcpClient([1, 6], {"6": 60})
+        entity = motor.CozyLifeMotorCountdown(client)
+        entity.hass = FakeHomeAssistant()
+
+        with patch.object(
+            number, "async_track_time_interval", return_value=Mock()
+        ), patch.object(entity, "async_write_ha_state"):
+            await entity.async_added_to_hass()
+            await entity.async_set_native_value(30)
+
+        self.assertEqual(client.last_query_attributes, [6])
+        self.assertEqual(client.last_payload, {"6": 30})
+
     async def test_variants_apply_configured_active_report(self) -> None:
         """Active reports update only the variant's own DPID state."""
         number = importlib.import_module(

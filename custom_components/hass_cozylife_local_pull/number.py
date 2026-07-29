@@ -36,7 +36,6 @@ COUNTDOWN_CALIBRATION_INTERVAL = timedelta(seconds=10)
 _COUNTDOWN_DEVICE_CONFIG = {
     LIGHT_TYPE_CODE: (LIGHT_COUNTDOWN, "Countdown"),
     SWITCH_TYPE_CODE: (SWITCH_COUNTDOWN, "Countdown 1"),
-    MOTOR_TYPE_CODE: (MOTOR_COUNTDOWN, "Countdown"),
 }
 
 
@@ -50,8 +49,15 @@ def setup_platform(
     if discovery_info is None:
         return
 
+    from .motor import CozyLifeMotorCountdown
+
     def add_ready_countdown(client: tcp_client) -> None:
         """Create a countdown when the device advertises its data point."""
+        if client.device_type_code == MOTOR_TYPE_CODE:
+            if int(MOTOR_COUNTDOWN) in client.dpid:
+                add_entities([CozyLifeMotorCountdown(client)])
+            return
+
         countdown_config = _COUNTDOWN_DEVICE_CONFIG.get(
             client.device_type_code
         )

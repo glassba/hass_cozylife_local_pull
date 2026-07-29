@@ -12,10 +12,17 @@ import threading
 import unittest
 from unittest.mock import Mock, patch
 
-from custom_components.hass_cozylife_local_pull import light, number, switch
+from custom_components.hass_cozylife_local_pull import (
+    light,
+    motor,
+    number,
+    switch,
+)
 from custom_components.hass_cozylife_local_pull.const import (
     DOMAIN,
     LIGHT_TYPE_CODE,
+    MOTOR_TYPE_CODE,
+    SUPPORT_DEVICE_CATEGORY,
     SWITCH_TYPE_CODE,
 )
 
@@ -25,7 +32,7 @@ class DelayedDeviceClient:
 
     device_id = "device-1234"
     device_model_name = "Test Device"
-    dpid = [1, 4, 13]
+    dpid = [1, 4, 6, 13]
 
     def __init__(self, device_type_code: str | type = str) -> None:
         self.device_type_code = device_type_code
@@ -1143,7 +1150,9 @@ class StartupReadinessTest(unittest.TestCase):
         cases = (
             (light, LIGHT_TYPE_CODE, light.CozyLifeLight),
             (switch, SWITCH_TYPE_CODE, switch.CozyLifeSwitch),
+            (switch, MOTOR_TYPE_CODE, motor.CozyLifeMotorSwitch),
             (number, LIGHT_TYPE_CODE, number.CozyLifeCountdown),
+            (number, MOTOR_TYPE_CODE, motor.CozyLifeMotorCountdown),
         )
 
         for platform, device_type_code, entity_type in cases:
@@ -1162,12 +1171,63 @@ class StartupReadinessTest(unittest.TestCase):
                 self.assertEqual(len(added_entities), 1)
                 self.assertIsInstance(added_entities[0], entity_type)
 
+    def test_motor_category_is_supported(self) -> None:
+        """Motor metadata is admitted by the integration's category list."""
+        self.assertIn(MOTOR_TYPE_CODE, SUPPORT_DEVICE_CATEGORY)
+
+    def test_motor_entities_extend_existing_platform_entities(self) -> None:
+        """Motor behavior specializes the established switch and countdown."""
+        self.assertTrue(
+            issubclass(motor.CozyLifeMotorSwitch, switch.CozyLifeSwitch)
+        )
+        self.assertTrue(
+            issubclass(
+                motor.CozyLifeMotorCountdown,
+                number.CozyLifeCountdown,
+            )
+        )
+
+    def test_motor_platforms_register_specialized_entities(self) -> None:
+        """Motor switch and countdown capabilities use motor-owned classes."""
+        cases = (
+            (switch, [1], "CozyLifeMotorSwitch"),
+            (number, [6], "CozyLifeMotorCountdown"),
+        )
+
+        for platform, dpid, expected_class_name in cases:
+            with self.subTest(platform=platform.__name__):
+                client = DelayedDeviceClient(MOTOR_TYPE_CODE)
+                client.dpid = dpid
+                hass = RecordingHomeAssistant([client])
+                added_entities = []
+
+                platform.setup_platform(
+                    hass, {}, added_entities.extend, discovery_info={}
+                )
+
+                self.assertEqual(len(added_entities), 1)
+                entity_type = type(added_entities[0])
+                self.assertEqual(
+                    entity_type.__module__,
+                    "custom_components.hass_cozylife_local_pull.motor",
+                )
+                self.assertEqual(entity_type.__name__, expected_class_name)
+
+                client.dpid = [2]
+                added_entities.clear()
+                platform.setup_platform(
+                    hass, {}, added_entities.extend, discovery_info={}
+                )
+                self.assertEqual(added_entities, [])
+
     def test_platforms_register_callbacks_for_already_ready_clients(self) -> None:
         """A handshake completed before platform setup cannot be missed."""
         cases = (
             (light, LIGHT_TYPE_CODE, light.CozyLifeLight),
             (switch, SWITCH_TYPE_CODE, switch.CozyLifeSwitch),
+            (switch, MOTOR_TYPE_CODE, motor.CozyLifeMotorSwitch),
             (number, LIGHT_TYPE_CODE, number.CozyLifeCountdown),
+            (number, MOTOR_TYPE_CODE, motor.CozyLifeMotorCountdown),
         )
 
         for platform, device_type_code, entity_type in cases:
@@ -1189,7 +1249,9 @@ class StartupReadinessTest(unittest.TestCase):
         cases = (
             (light, LIGHT_TYPE_CODE, light.CozyLifeLight),
             (switch, SWITCH_TYPE_CODE, switch.CozyLifeSwitch),
+            (switch, MOTOR_TYPE_CODE, motor.CozyLifeMotorSwitch),
             (number, LIGHT_TYPE_CODE, number.CozyLifeCountdown),
+            (number, MOTOR_TYPE_CODE, motor.CozyLifeMotorCountdown),
         )
 
         for platform, device_type_code, entity_type in cases:
@@ -1236,7 +1298,7 @@ class StartupReadinessTest(unittest.TestCase):
         cases = (
             (LIGHT_TYPE_CODE, [1, 13], "13", "Countdown"),
             (SWITCH_TYPE_CODE, [1, 2], "2", "Countdown 1"),
-            ("02", [1, 6], "6", "Countdown"),
+            (MOTOR_TYPE_CODE, [1, 6], "6", "Countdown"),
         )
 
         for device_type_code, dpid, expected_dp_id, label_suffix in cases:
@@ -1262,7 +1324,7 @@ class StartupReadinessTest(unittest.TestCase):
         cases = (
             (LIGHT_TYPE_CODE, [1, 2]),
             (SWITCH_TYPE_CODE, [1, 13]),
-            ("02", [1, 2]),
+            (MOTOR_TYPE_CODE, [1, 2]),
             ("99", [1, 2, 6, 13]),
         )
 

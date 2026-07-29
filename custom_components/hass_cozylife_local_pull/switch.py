@@ -11,6 +11,7 @@ from homeassistant.helpers.typing import ConfigType, DiscoveryInfoType
 from typing import Any, Final, Literal, TypedDict, final
 from .const import (
     DOMAIN,
+    MOTOR_TYPE_CODE,
     SWITCH_TYPE_CODE,
     LIGHT_TYPE_CODE,
     LIGHT_DPID,
@@ -44,11 +45,17 @@ def setup_platform(
     if discovery_info is None:
         return
 
+    from .motor import CozyLifeMotorSwitch
 
     def add_ready_switch(item) -> None:
         """Add a switch when its device information becomes available."""
         if SWITCH_TYPE_CODE == item.device_type_code:
             add_entities([CozyLifeSwitch(item)])
+        elif (
+            MOTOR_TYPE_CODE == item.device_type_code
+            and int(SWITCH) in item.dpid
+        ):
+            add_entities([CozyLifeMotorSwitch(item)])
 
     def register_client(item) -> None:
         """Attach the switch readiness callback to one network client."""
@@ -60,6 +67,7 @@ def setup_platform(
 class CozyLifeSwitch(SwitchEntity):
     _tcp_client = None
     _attr_is_on = True
+    _turn_on_value = 255
     
     def __init__(self, tcp_client) -> None:
         """Initialize the sensor."""
@@ -201,7 +209,7 @@ class CozyLifeSwitch(SwitchEntity):
     async def async_turn_on(self, **kwargs: Any) -> None:
         """Turn on the switch without changing state from a worker thread."""
         _LOGGER.info(f'turn_on:{kwargs}')
-        await self._async_control(255)
+        await self._async_control(self._turn_on_value)
 
     async def async_turn_off(self, **kwargs: Any) -> None:
         """Turn off the switch without changing state from a worker thread."""
