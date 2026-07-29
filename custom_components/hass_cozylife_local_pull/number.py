@@ -1,4 +1,4 @@
-"""Expose device-backed numeric controls for CozyLife lights."""
+"""Expose device-backed countdown controls for CozyLife devices."""
 
 from __future__ import annotations
 
@@ -20,12 +20,24 @@ from homeassistant.helpers.event import async_track_time_interval
 from homeassistant.helpers.typing import ConfigType, DiscoveryInfoType
 
 from . import register_client_callback
-from .const import LIGHT_COUNTDOWN, LIGHT_TYPE_CODE
+from .const import (
+    LIGHT_COUNTDOWN,
+    LIGHT_TYPE_CODE,
+    MOTOR_COUNTDOWN,
+    MOTOR_TYPE_CODE,
+    SWITCH_COUNTDOWN,
+    SWITCH_TYPE_CODE,
+)
 from .tcp_client import DeviceCommandRejectedError, tcp_client
 
 
 COUNTDOWN_TICK_INTERVAL = timedelta(seconds=1)
 COUNTDOWN_CALIBRATION_INTERVAL = timedelta(seconds=10)
+_COUNTDOWN_DEVICE_CONFIG = {
+    LIGHT_TYPE_CODE: (LIGHT_COUNTDOWN, "Countdown"),
+    SWITCH_TYPE_CODE: (SWITCH_COUNTDOWN, "Countdown 1"),
+    MOTOR_TYPE_CODE: (MOTOR_COUNTDOWN, "Countdown"),
+}
 
 
 def setup_platform(
@@ -34,17 +46,21 @@ def setup_platform(
     add_entities: AddEntitiesCallback,
     discovery_info: DiscoveryInfoType | None = None,
 ) -> None:
-    """Add countdown controls after each capable light finishes its handshake."""
+    """Add countdown controls after a capable device finishes its handshake."""
     if discovery_info is None:
         return
 
     def add_ready_countdown(client: tcp_client) -> None:
-        """Create a countdown only when the model advertises DPID 13."""
-        if (
-            client.device_type_code == LIGHT_TYPE_CODE
-            and int(LIGHT_COUNTDOWN) in client.dpid
-        ):
-            add_entities([CozyLifeLightCountdown(client)])
+        """Create a countdown when the device advertises its data point."""
+        countdown_config = _COUNTDOWN_DEVICE_CONFIG.get(
+            client.device_type_code
+        )
+        if countdown_config is None:
+            return
+        dp_id, label_suffix = countdown_config
+        if int(dp_id) not in client.dpid:
+            return
+        add_entities([CozyLifeCountdown(client, dp_id, label_suffix)])
 
     def register_client(client: tcp_client) -> None:
         """Attach the countdown capability check to one network client."""
@@ -53,8 +69,8 @@ def setup_platform(
     register_client_callback(hass, register_client)
 
 
-class CozyLifeLightCountdown(NumberEntity):
-    """Represent a light's device-local countdown in seconds."""
+class CozyLifeCountdown(NumberEntity):
+    """Represent a device-local countdown in seconds."""
 
     _attr_device_class = NumberDeviceClass.DURATION
     _attr_mode = NumberMode.BOX
@@ -66,9 +82,15 @@ class CozyLifeLightCountdown(NumberEntity):
     _attr_force_update = True
     _attr_should_poll = False
 
-    def __init__(self, client) -> None:
-        """Initialize the entity from the device's reported countdown."""
+    def __init__(
+        self,
+        client: tcp_client,
+        dp_id: str,
+        label_suffix: str,
+    ) -> None:
+        """Initialize one countdown variant without device input or output."""
         self._tcp_client = client
+        self._dp_id = dp_id
         self._countdown_deadline: float | None = None
         self._state_updates_active = False
         self._initial_query_complete = False
@@ -76,25 +98,27 @@ class CozyLifeLightCountdown(NumberEntity):
         self._cancel_countdown_calibration: Callable[[], None] | None = None
         self._remove_state_callback: Callable[[], None] | None = None
         self._attr_name = (
-            f"{client.device_model_name} {client.device_id[-4:]} Countdown"
+            f"{client.device_model_name} {client.device_id[-4:]} "
+            f"{label_suffix}"
         )
-        self._attr_unique_id = f"{client.device_id}_countdown"
+        unique_id_suffix = label_suffix.lower().replace(" ", "_")
+        self._attr_unique_id = f"{client.device_id}_{unique_id_suffix}"
         self._attr_available = False
         self._attr_native_value = 0
 
     def _query_countdown_state(self) -> dict:
-        """Query DPID 13 without changing Home Assistant entity state."""
-        return self._tcp_client.query([int(LIGHT_COUNTDOWN)])
+        """Query the countdown data point without changing entity state."""
+        return self._tcp_client.query([int(self._dp_id)])
 
     def _apply_countdown_query(self, state: dict) -> None:
         """Apply one device query result on the owning execution context."""
-        if LIGHT_COUNTDOWN not in state:
+        if self._dp_id not in state:
             self._attr_available = False
             self._countdown_deadline = None
             return
 
         countdown_seconds = self._parse_countdown_seconds(
-            state[LIGHT_COUNTDOWN]
+            state[self._dp_id]
         )
         if countdown_seconds is None:
             self._attr_available = False
@@ -112,7 +136,7 @@ class CozyLifeLightCountdown(NumberEntity):
     ) -> bool:
         """Apply an empty query only when no newer state arrived meanwhile."""
         if (
-            LIGHT_COUNTDOWN in state
+            self._dp_id in state
             or self._tcp_client.last_state_sequence_number
             != sequence_number_before_query
         ):
@@ -191,11 +215,11 @@ class CozyLifeLightCountdown(NumberEntity):
     def _handle_state_report(
         self, state: dict, sequence_number: int
     ) -> None:
-        """Move DPID 13 state from the network thread to the event loop."""
-        if LIGHT_COUNTDOWN in state and self.hass is not None:
+        """Move countdown state from the network thread to the event loop."""
+        if self._dp_id in state and self.hass is not None:
             self.hass.loop.call_soon_threadsafe(
                 self._apply_countdown_report,
-                state[LIGHT_COUNTDOWN],
+                state[self._dp_id],
                 sequence_number,
             )
 
@@ -228,7 +252,7 @@ class CozyLifeLightCountdown(NumberEntity):
             self.async_write_ha_state()
 
     async def _async_calibrate_countdown(self, _now: datetime) -> None:
-        """Query DPID 13 off the event loop and publish calibrated state."""
+        """Query the countdown off the event loop and publish calibration."""
         if not self._state_updates_active:
             return
         sequence_number_before_query = (
@@ -293,7 +317,7 @@ class CozyLifeLightCountdown(NumberEntity):
         await super().async_will_remove_from_hass()
 
     async def async_update(self) -> None:
-        """Refresh DPID 13 without applying worker-thread state changes."""
+        """Refresh the countdown without worker-thread state changes."""
         if not self._state_updates_active:
             return
         sequence_number_before_query = (
@@ -319,7 +343,7 @@ class CozyLifeLightCountdown(NumberEntity):
         try:
             control_succeeded = await self.hass.async_add_executor_job(
                 self._tcp_client.control,
-                {LIGHT_COUNTDOWN: countdown_seconds},
+                {self._dp_id: countdown_seconds},
             )
         except DeviceCommandRejectedError as err:
             raise HomeAssistantError(

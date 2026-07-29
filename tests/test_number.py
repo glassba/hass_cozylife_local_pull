@@ -1,4 +1,4 @@
-"""Regression tests for the CozyLife light countdown number platform."""
+"""Regression tests for CozyLife device countdown number entities."""
 
 from __future__ import annotations
 
@@ -156,6 +156,11 @@ class ThreadedHomeAssistant:
         return result
 
 
+def _light_countdown(number_module, client):
+    """Create the existing light countdown variant for shared state tests."""
+    return number_module.CozyLifeCountdown(client, "13", "Countdown")
+
+
 class NumberImportTest(unittest.TestCase):
     """Verify the countdown platform is available to Home Assistant."""
 
@@ -166,6 +171,103 @@ class NumberImportTest(unittest.TestCase):
         )
 
         self.assertIsNotNone(module)
+
+
+class CountdownDeviceVariantTest(unittest.IsolatedAsyncioTestCase):
+    """Verify switch and motor countdowns use their configured identity and DPID."""
+
+    CASES = (
+        ("2", "Countdown 1", "Test Switch", "device-1234_countdown_1"),
+        ("6", "Countdown", "Test Motor", "device-1234_countdown"),
+    )
+
+    def test_variants_expose_expected_identity(self) -> None:
+        """Each variant derives its name and unique ID from its label suffix."""
+        number = importlib.import_module(
+            "custom_components.hass_cozylife_local_pull.number"
+        )
+
+        for dp_id, label_suffix, model_name, unique_id in self.CASES:
+            with self.subTest(dp_id=dp_id):
+                client = FakeTcpClient([1, int(dp_id)], {dp_id: 0})
+                client.device_model_name = model_name
+
+                entity = number.CozyLifeCountdown(
+                    client, dp_id, label_suffix
+                )
+
+                self.assertEqual(
+                    entity.name,
+                    f"{model_name} 1234 {label_suffix}",
+                )
+                self.assertEqual(entity.unique_id, unique_id)
+
+    async def test_variants_query_configured_dpid(self) -> None:
+        """Initial state queries target the variant's own DPID."""
+        number = importlib.import_module(
+            "custom_components.hass_cozylife_local_pull.number"
+        )
+
+        for dp_id, label_suffix, _model_name, _unique_id in self.CASES:
+            with self.subTest(dp_id=dp_id):
+                client = FakeTcpClient([1, int(dp_id)], {dp_id: 60})
+                entity = number.CozyLifeCountdown(
+                    client, dp_id, label_suffix
+                )
+                entity.hass = FakeHomeAssistant()
+
+                with patch.object(
+                    number, "async_track_time_interval", return_value=Mock()
+                ):
+                    await entity.async_added_to_hass()
+
+                self.assertEqual(client.last_query_attributes, [int(dp_id)])
+                self.assertEqual(entity.native_value, 60)
+
+    async def test_variants_apply_configured_active_report(self) -> None:
+        """Active reports update only the variant's own DPID state."""
+        number = importlib.import_module(
+            "custom_components.hass_cozylife_local_pull.number"
+        )
+
+        for dp_id, label_suffix, _model_name, _unique_id in self.CASES:
+            with self.subTest(dp_id=dp_id):
+                client = FakeTcpClient([1, int(dp_id)], {dp_id: 0})
+                entity = number.CozyLifeCountdown(
+                    client, dp_id, label_suffix
+                )
+                entity.hass = FakeHomeAssistant()
+
+                with patch.object(
+                    number, "async_track_time_interval", return_value=Mock()
+                ), patch.object(entity, "async_write_ha_state"):
+                    await entity.async_added_to_hass()
+                    client.report({dp_id: 45})
+
+                self.assertEqual(entity.native_value, 45)
+
+    async def test_variants_control_configured_dpid(self) -> None:
+        """Number commands write the variant's own DPID."""
+        number = importlib.import_module(
+            "custom_components.hass_cozylife_local_pull.number"
+        )
+
+        for dp_id, label_suffix, _model_name, _unique_id in self.CASES:
+            with self.subTest(dp_id=dp_id):
+                client = FakeTcpClient([1, int(dp_id)], {dp_id: 0})
+                entity = number.CozyLifeCountdown(
+                    client, dp_id, label_suffix
+                )
+                entity.hass = FakeHomeAssistant()
+
+                with patch.object(
+                    number, "async_track_time_interval", return_value=Mock()
+                ), patch.object(entity, "async_write_ha_state"):
+                    await entity.async_added_to_hass()
+                    await entity.async_set_native_value(30)
+
+                self.assertEqual(client.last_payload, {dp_id: 30})
+                self.assertEqual(entity.native_value, 30)
 
 
 class LightCountdownStateTest(unittest.IsolatedAsyncioTestCase):
@@ -179,7 +281,7 @@ class LightCountdownStateTest(unittest.IsolatedAsyncioTestCase):
         client = TimestampedCountdownClient(
             [1, 13], {"13": 0}, {"13": 5}
         )
-        entity = number.CozyLifeLightCountdown(client)
+        entity = _light_countdown(number, client)
         entity.hass = FakeHomeAssistant()
 
         with patch.object(
@@ -196,10 +298,10 @@ class LightCountdownStateTest(unittest.IsolatedAsyncioTestCase):
         number = importlib.import_module(
             "custom_components.hass_cozylife_local_pull.number"
         )
-        self.assertTrue(hasattr(number, "CozyLifeLightCountdown"))
+        self.assertTrue(hasattr(number, "CozyLifeCountdown"))
 
         client = FakeTcpClient([1, 13], {"1": 1, "13": 60})
-        entity = number.CozyLifeLightCountdown(client)
+        entity = _light_countdown(number, client)
         entity.hass = FakeHomeAssistant()
         with patch.object(
             number, "async_track_time_interval", return_value=Mock()
@@ -218,7 +320,7 @@ class LightCountdownStateTest(unittest.IsolatedAsyncioTestCase):
         )
         client = FakeTcpClient([1, 13], {"1": 1, "13": 60})
 
-        entity = number.CozyLifeLightCountdown(client)
+        entity = _light_countdown(number, client)
 
         self.assertEqual(entity.native_min_value, 0)
         self.assertEqual(entity.native_max_value, 86400)
@@ -235,7 +337,7 @@ class LightCountdownStateTest(unittest.IsolatedAsyncioTestCase):
             "custom_components.hass_cozylife_local_pull.number"
         )
         client = FakeTcpClient([1, 13], {"1": 1, "13": 60})
-        entity = number.CozyLifeLightCountdown(client)
+        entity = _light_countdown(number, client)
         entity.hass = FakeHomeAssistant()
         with patch.object(
             number, "async_track_time_interval", return_value=Mock()
@@ -256,7 +358,7 @@ class LightCountdownStateTest(unittest.IsolatedAsyncioTestCase):
             "custom_components.hass_cozylife_local_pull.number"
         )
         client = FakeTcpClient([1, 13], {"1": 1, "13": 60})
-        entity = number.CozyLifeLightCountdown(client)
+        entity = _light_countdown(number, client)
         entity.hass = FakeHomeAssistant()
         with patch.object(
             number, "async_track_time_interval", return_value=Mock()
@@ -279,7 +381,7 @@ class LightCountdownStateTest(unittest.IsolatedAsyncioTestCase):
         for invalid_value in (None, "invalid", -1, 86401, 1.5, 10**1000):
             with self.subTest(value=invalid_value):
                 client = FakeTcpClient([1, 13], {"13": invalid_value})
-                entity = number.CozyLifeLightCountdown(client)
+                entity = _light_countdown(number, client)
                 entity._apply_countdown_query({"13": 60})
 
                 try:
@@ -297,7 +399,7 @@ class LightCountdownStateTest(unittest.IsolatedAsyncioTestCase):
             "custom_components.hass_cozylife_local_pull.number"
         )
         client = FakeTcpClient([1, 13], {"13": 0})
-        entity = number.CozyLifeLightCountdown(client)
+        entity = _light_countdown(number, client)
         event_loop_thread = threading.get_ident()
         entity.hass = ThreadedHomeAssistant(asyncio.get_running_loop())
         self.assertTrue(hasattr(entity, "async_update"))
@@ -352,7 +454,7 @@ class LightCountdownInitialQueryTest(unittest.IsolatedAsyncioTestCase):
             return query(attributes)
 
         with patch.object(client, "query", side_effect=record_query):
-            entity = number.CozyLifeLightCountdown(client)
+            entity = _light_countdown(number, client)
             self.assertEqual(query_threads, [])
             entity.hass = ThreadedHomeAssistant(asyncio.get_running_loop())
             await entity.async_added_to_hass()
@@ -370,7 +472,7 @@ class LightCountdownInitialQueryTest(unittest.IsolatedAsyncioTestCase):
             "custom_components.hass_cozylife_local_pull.number"
         )
         client = FakeTcpClient([1, 13], {})
-        entity = number.CozyLifeLightCountdown(client)
+        entity = _light_countdown(number, client)
         entity.hass = FakeHomeAssistant()
         subscribed_during_query = []
 
@@ -397,7 +499,7 @@ class LightCountdownInitialQueryTest(unittest.IsolatedAsyncioTestCase):
             "custom_components.hass_cozylife_local_pull.number"
         )
         client = FakeTcpClient([1, 13], {"13": "invalid"})
-        entity = number.CozyLifeLightCountdown(client)
+        entity = _light_countdown(number, client)
         entity.hass = FakeHomeAssistant()
 
         with patch.object(
@@ -420,11 +522,11 @@ class LightCountdownControlTest(unittest.IsolatedAsyncioTestCase):
             "custom_components.hass_cozylife_local_pull.number"
         )
         self.assertIsNot(
-            number.CozyLifeLightCountdown.async_set_native_value,
+            number.CozyLifeCountdown.async_set_native_value,
             NumberEntity.async_set_native_value,
         )
         client = FakeTcpClient([1, 13], {"1": 1, "13": 0})
-        entity = number.CozyLifeLightCountdown(client)
+        entity = _light_countdown(number, client)
         entity.hass = FakeHomeAssistant(asyncio.get_running_loop())
 
         with patch.object(
@@ -444,11 +546,11 @@ class LightCountdownControlTest(unittest.IsolatedAsyncioTestCase):
             "custom_components.hass_cozylife_local_pull.number"
         )
         self.assertIsNot(
-            number.CozyLifeLightCountdown.async_set_native_value,
+            number.CozyLifeCountdown.async_set_native_value,
             NumberEntity.async_set_native_value,
         )
         client = FakeTcpClient([1, 13], {"1": 1, "13": 60})
-        entity = number.CozyLifeLightCountdown(client)
+        entity = _light_countdown(number, client)
         entity.hass = FakeHomeAssistant(asyncio.get_running_loop())
 
         with patch.object(
@@ -470,7 +572,7 @@ class LightCountdownControlTest(unittest.IsolatedAsyncioTestCase):
         for invalid_value in (-1, 86401, 1.5, float("inf"), float("nan")):
             with self.subTest(value=invalid_value):
                 client = FakeTcpClient([1, 13], {"1": 1, "13": 60})
-                entity = number.CozyLifeLightCountdown(client)
+                entity = _light_countdown(number, client)
                 entity._apply_countdown_query(client.query([13]))
 
                 with self.assertRaises(HomeAssistantError):
@@ -486,7 +588,7 @@ class LightCountdownControlTest(unittest.IsolatedAsyncioTestCase):
             "custom_components.hass_cozylife_local_pull.number"
         )
         client = FakeTcpClient([1, 13], {"1": 1, "13": 60})
-        entity = number.CozyLifeLightCountdown(client)
+        entity = _light_countdown(number, client)
         entity.hass = FakeHomeAssistant(asyncio.get_running_loop())
         error = None
 
@@ -517,7 +619,7 @@ class LightCountdownControlTest(unittest.IsolatedAsyncioTestCase):
         client = FakeTcpClient(
             [1, 13], {"1": 1, "13": 60}, control_result=False
         )
-        entity = number.CozyLifeLightCountdown(client)
+        entity = _light_countdown(number, client)
         entity.hass = FakeHomeAssistant(asyncio.get_running_loop())
         error = None
 
@@ -543,7 +645,7 @@ class LightCountdownControlTest(unittest.IsolatedAsyncioTestCase):
         client = FakeTcpClient(
             [1, 13], {"1": 1, "13": 60}, control_result=False
         )
-        entity = number.CozyLifeLightCountdown(client)
+        entity = _light_countdown(number, client)
         entity.hass = FakeHomeAssistant(asyncio.get_running_loop())
 
         with patch.object(
@@ -569,7 +671,7 @@ class LightCountdownControlTest(unittest.IsolatedAsyncioTestCase):
             "custom_components.hass_cozylife_local_pull.number"
         )
         client = FakeTcpClient([1, 13], {"13": 0})
-        entity = number.CozyLifeLightCountdown(client)
+        entity = _light_countdown(number, client)
         event_loop_thread = threading.get_ident()
         entity.hass = ThreadedHomeAssistant(asyncio.get_running_loop())
         control_threads = []
@@ -608,7 +710,7 @@ class LightCountdownControlTest(unittest.IsolatedAsyncioTestCase):
             "custom_components.hass_cozylife_local_pull.number"
         )
         client = FakeTcpClient([1, 13], {"13": 0})
-        entity = number.CozyLifeLightCountdown(client)
+        entity = _light_countdown(number, client)
         entity.hass = FakeHomeAssistant(asyncio.get_running_loop())
 
         with patch.object(
@@ -629,7 +731,7 @@ class LightCountdownTimerTest(unittest.IsolatedAsyncioTestCase):
             "custom_components.hass_cozylife_local_pull.number"
         )
         client = FakeTcpClient([1, 13], {"13": 30})
-        entity = number.CozyLifeLightCountdown(client)
+        entity = _light_countdown(number, client)
 
         self.assertTrue(is_callback(entity._handle_countdown_tick))
 
@@ -639,7 +741,7 @@ class LightCountdownTimerTest(unittest.IsolatedAsyncioTestCase):
             "custom_components.hass_cozylife_local_pull.number"
         )
         client = FakeTcpClient([1, 13], {"13": 0})
-        entity = number.CozyLifeLightCountdown(client)
+        entity = _light_countdown(number, client)
 
         self.assertFalse(entity.should_poll)
         self.assertEqual(
@@ -669,7 +771,7 @@ class LightCountdownTimerTest(unittest.IsolatedAsyncioTestCase):
             side_effect=track_interval,
         ):
             client = FakeTcpClient([1, 13], {"13": 0})
-            entity = number.CozyLifeLightCountdown(client)
+            entity = _light_countdown(number, client)
             entity.hass = FakeHomeAssistant()
             await entity.async_added_to_hass()
 
@@ -701,7 +803,7 @@ class LightCountdownTimerTest(unittest.IsolatedAsyncioTestCase):
             "custom_components.hass_cozylife_local_pull.number"
         )
         client = FakeTcpClient([1, 13], {"13": 0})
-        entity = number.CozyLifeLightCountdown(client)
+        entity = _light_countdown(number, client)
         entity.hass = FakeHomeAssistant()
 
         with patch.object(
@@ -726,7 +828,7 @@ class LightCountdownTimerTest(unittest.IsolatedAsyncioTestCase):
         )
         client = FakeTcpClient([1, 13], {"13": 0})
         loop = QueuedLoop()
-        entity = number.CozyLifeLightCountdown(client)
+        entity = _light_countdown(number, client)
         entity.hass = FakeHomeAssistant(loop)
 
         with patch.object(
@@ -747,7 +849,7 @@ class LightCountdownTimerTest(unittest.IsolatedAsyncioTestCase):
             "custom_components.hass_cozylife_local_pull.number"
         )
         client = FakeTcpClient([1, 13], {"13": 0})
-        entity = number.CozyLifeLightCountdown(client)
+        entity = _light_countdown(number, client)
         entity.hass = FakeHomeAssistant()
         with patch.object(
             number, "async_track_time_interval", return_value=Mock()
@@ -783,7 +885,7 @@ class LightCountdownTimerTest(unittest.IsolatedAsyncioTestCase):
             return cancel_callback
 
         client = FakeTcpClient([1, 13], {"13": 60})
-        entity = number.CozyLifeLightCountdown(client)
+        entity = _light_countdown(number, client)
         entity.hass = FakeHomeAssistant()
         with patch.object(
             number,
@@ -822,7 +924,7 @@ class LightCountdownTimerTest(unittest.IsolatedAsyncioTestCase):
         for query_source in ("refresh", "calibration"):
             with self.subTest(query_source=query_source):
                 client = FakeTcpClient([1, 13], {"13": 60})
-                entity = number.CozyLifeLightCountdown(client)
+                entity = _light_countdown(number, client)
                 entity.hass = FakeHomeAssistant()
                 cancel_tick = Mock()
                 cancel_calibration = Mock()
@@ -866,7 +968,7 @@ class LightCountdownTimerTest(unittest.IsolatedAsyncioTestCase):
             "custom_components.hass_cozylife_local_pull.number"
         )
         client = FakeTcpClient([1, 13], {"13": 0})
-        entity = number.CozyLifeLightCountdown(client)
+        entity = _light_countdown(number, client)
         entity.hass = FakeHomeAssistant()
         with patch.object(
             number, "async_track_time_interval", return_value=Mock()
@@ -885,7 +987,8 @@ class LightCountdownTimerTest(unittest.IsolatedAsyncioTestCase):
         number = importlib.import_module(
             "custom_components.hass_cozylife_local_pull.number"
         )
-        entity = number.CozyLifeLightCountdown(
+        entity = _light_countdown(
+            number,
             FakeTcpClient([1, 13], {"13": 0})
         )
         hass = HomeAssistant("/tmp")
@@ -909,7 +1012,7 @@ class LightCountdownTimerTest(unittest.IsolatedAsyncioTestCase):
             "custom_components.hass_cozylife_local_pull.number"
         )
         client = FakeTcpClient([1, 13], {"13": 0})
-        entity = number.CozyLifeLightCountdown(client)
+        entity = _light_countdown(number, client)
         hass = HomeAssistant("/tmp")
         entity.hass = hass
         entity.entity_id = "number.test_active_countdown"
@@ -955,7 +1058,7 @@ class LightCountdownTimerTest(unittest.IsolatedAsyncioTestCase):
             number, "monotonic", return_value=100, create=True
         ):
             client = FakeTcpClient([1, 13], {"13": 3})
-            entity = number.CozyLifeLightCountdown(client)
+            entity = _light_countdown(number, client)
             entity.hass = FakeHomeAssistant()
             await entity.async_added_to_hass()
 
@@ -1006,7 +1109,7 @@ class LightCountdownTimerTest(unittest.IsolatedAsyncioTestCase):
             create=True,
         ), patch.object(number, "monotonic", return_value=100, create=True):
             client = FakeTcpClient([1, 13], {"13": 5})
-            entity = number.CozyLifeLightCountdown(client)
+            entity = _light_countdown(number, client)
             entity.hass = FakeHomeAssistant()
             await entity.async_added_to_hass()
 
@@ -1042,7 +1145,7 @@ class LightCountdownTimerTest(unittest.IsolatedAsyncioTestCase):
             "custom_components.hass_cozylife_local_pull.number"
         )
         client = FakeTcpClient([1, 13], {"13": 0})
-        entity = number.CozyLifeLightCountdown(client)
+        entity = _light_countdown(number, client)
         event_loop_thread = threading.get_ident()
         entity.hass = ThreadedHomeAssistant(asyncio.get_running_loop())
         await entity.async_added_to_hass()
@@ -1093,7 +1196,7 @@ class LightCountdownTimerTest(unittest.IsolatedAsyncioTestCase):
             number, "async_track_time_interval", side_effect=track_interval
         ), patch.object(number, "monotonic", return_value=100):
             client = FakeTcpClient([1, 13], {"13": 30})
-            entity = number.CozyLifeLightCountdown(client)
+            entity = _light_countdown(number, client)
             entity.hass = FakeHomeAssistant()
             await entity.async_added_to_hass()
             stale_tick = callbacks[timedelta(seconds=1)]
@@ -1131,7 +1234,7 @@ class LightCountdownTimerTest(unittest.IsolatedAsyncioTestCase):
             number, "async_track_time_interval", side_effect=track_interval
         ), patch.object(number, "monotonic", return_value=100):
             client = FakeTcpClient([1, 13], {"13": 30})
-            entity = number.CozyLifeLightCountdown(client)
+            entity = _light_countdown(number, client)
             entity.hass = FakeHomeAssistant()
             await entity.async_added_to_hass()
             calibration = callbacks[timedelta(seconds=10)]
@@ -1174,7 +1277,7 @@ class LightCountdownTimerTest(unittest.IsolatedAsyncioTestCase):
                     number, "monotonic", return_value=100, create=True
                 ):
                     client = FakeTcpClient([1, 13], {"13": 30})
-                    entity = number.CozyLifeLightCountdown(client)
+                    entity = _light_countdown(number, client)
                     entity.hass = FakeHomeAssistant()
                     await entity.async_added_to_hass()
 
@@ -1203,7 +1306,7 @@ class LightCountdownTimerTest(unittest.IsolatedAsyncioTestCase):
             number, "monotonic", return_value=100, create=True
         ):
             client = FakeTcpClient([1, 13], {"13": 0})
-            entity = number.CozyLifeLightCountdown(client)
+            entity = _light_countdown(number, client)
             entity.hass = FakeHomeAssistant()
             await entity.async_added_to_hass()
             track_interval.assert_called_once_with(

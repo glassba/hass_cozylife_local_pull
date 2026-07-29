@@ -1143,7 +1143,7 @@ class StartupReadinessTest(unittest.TestCase):
         cases = (
             (light, LIGHT_TYPE_CODE, light.CozyLifeLight),
             (switch, SWITCH_TYPE_CODE, switch.CozyLifeSwitch),
-            (number, LIGHT_TYPE_CODE, number.CozyLifeLightCountdown),
+            (number, LIGHT_TYPE_CODE, number.CozyLifeCountdown),
         )
 
         for platform, device_type_code, entity_type in cases:
@@ -1167,7 +1167,7 @@ class StartupReadinessTest(unittest.TestCase):
         cases = (
             (light, LIGHT_TYPE_CODE, light.CozyLifeLight),
             (switch, SWITCH_TYPE_CODE, switch.CozyLifeSwitch),
-            (number, LIGHT_TYPE_CODE, number.CozyLifeLightCountdown),
+            (number, LIGHT_TYPE_CODE, number.CozyLifeCountdown),
         )
 
         for platform, device_type_code, entity_type in cases:
@@ -1189,7 +1189,7 @@ class StartupReadinessTest(unittest.TestCase):
         cases = (
             (light, LIGHT_TYPE_CODE, light.CozyLifeLight),
             (switch, SWITCH_TYPE_CODE, switch.CozyLifeSwitch),
-            (number, LIGHT_TYPE_CODE, number.CozyLifeLightCountdown),
+            (number, LIGHT_TYPE_CODE, number.CozyLifeCountdown),
         )
 
         for platform, device_type_code, entity_type in cases:
@@ -1215,7 +1215,7 @@ class StartupReadinessTest(unittest.TestCase):
         cases = (
             (light, SWITCH_TYPE_CODE),
             (switch, LIGHT_TYPE_CODE),
-            (number, SWITCH_TYPE_CODE),
+            (number, "99"),
         )
 
         for platform, device_type_code in cases:
@@ -1231,16 +1231,51 @@ class StartupReadinessTest(unittest.TestCase):
                 self.assertEqual(client.registration_count, 1)
                 self.assertEqual(added_entities, [])
 
-    def test_countdown_platform_ignores_light_without_dpid_13(self) -> None:
-        """A light without countdown capability gets no number entity."""
-        client = DelayedDeviceClient(LIGHT_TYPE_CODE)
-        client.dpid = [1, 4]
-        hass = RecordingHomeAssistant([client])
-        added_entities = []
-
-        number.setup_platform(
-            hass, {}, added_entities.extend, discovery_info={}
+    def test_countdown_platform_adds_each_supported_device_dpid(self) -> None:
+        """Each supported device type creates its matching countdown entity."""
+        cases = (
+            (LIGHT_TYPE_CODE, [1, 13], "13", "Countdown"),
+            (SWITCH_TYPE_CODE, [1, 2], "2", "Countdown 1"),
+            ("02", [1, 6], "6", "Countdown"),
         )
 
-        self.assertEqual(client.registration_count, 1)
-        self.assertEqual(added_entities, [])
+        for device_type_code, dpid, expected_dp_id, label_suffix in cases:
+            with self.subTest(device_type_code=device_type_code):
+                client = DelayedDeviceClient(device_type_code)
+                client.dpid = dpid
+                hass = RecordingHomeAssistant([client])
+                added_entities = []
+
+                number.setup_platform(
+                    hass, {}, added_entities.extend, discovery_info={}
+                )
+
+                self.assertEqual(client.registration_count, 1)
+                self.assertEqual(len(added_entities), 1)
+                entity = added_entities[0]
+                self.assertIsInstance(entity, number.CozyLifeCountdown)
+                self.assertEqual(entity._dp_id, expected_dp_id)
+                self.assertTrue(entity.name.endswith(label_suffix))
+
+    def test_countdown_platform_rejects_mismatched_capabilities(self) -> None:
+        """Unknown types and mismatched DPIDs create no countdown entity."""
+        cases = (
+            (LIGHT_TYPE_CODE, [1, 2]),
+            (SWITCH_TYPE_CODE, [1, 13]),
+            ("02", [1, 2]),
+            ("99", [1, 2, 6, 13]),
+        )
+
+        for device_type_code, dpid in cases:
+            with self.subTest(device_type_code=device_type_code, dpid=dpid):
+                client = DelayedDeviceClient(device_type_code)
+                client.dpid = dpid
+                hass = RecordingHomeAssistant([client])
+                added_entities = []
+
+                number.setup_platform(
+                    hass, {}, added_entities.extend, discovery_info={}
+                )
+
+                self.assertEqual(client.registration_count, 1)
+                self.assertEqual(added_entities, [])
