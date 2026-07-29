@@ -1,6 +1,7 @@
 """Platform for sensor integration."""
 from __future__ import annotations
 
+from collections.abc import Callable
 from homeassistant.components.sensor import SensorEntity
 from homeassistant.components.switch import SwitchEntity
 # from homeassistant.components.light import *
@@ -81,7 +82,7 @@ class CozyLifeLight(LightEntity):
     _tcp_client = None
     
     _attr_supported_color_modes: set[ColorMode]
-    _attr_color_mode: ColorMode
+    _attr_color_mode: ColorMode | None
     
     # _unique_id = str
     # _attr_is_on = True
@@ -94,6 +95,10 @@ class CozyLifeLight(LightEntity):
         """Initialize color capabilities independently for this light."""
         _LOGGER.info('__init__')
         self._tcp_client = tcp_client
+        self._state: dict[str, int] = {}
+        self._state_updates_active = False
+        self._initial_query_complete = False
+        self._remove_state_callback: Callable[[], None] | None = None
         self._unique_id = tcp_client.device_id
         self._name = tcp_client.device_model_name + ' ' + tcp_client.device_id[-4:]
         self._attr_supported_color_modes = set()
@@ -122,28 +127,142 @@ class CozyLifeLight(LightEntity):
     
     def _refresh_state(self) -> None:
         """Refresh state, marking the light unavailable without switch data."""
-        self._state = self._tcp_client.query()
-        _LOGGER.info(f'_state={self._state}')
-        if '1' not in self._state:
+        state = self._tcp_client.query()
+        _LOGGER.info(f'_state={state}')
+        self._apply_polled_state(state)
+
+    def _apply_polled_state(self, state: dict[str, int]) -> None:
+        """Apply one complete query result to the light entity."""
+        if SWITCH not in state:
+            self._state.pop(SWITCH, None)
             self._attr_available = False
             return
 
+        self._state = state
         self._attr_available = True
-        self._attr_is_on = 0 < self._state['1']
-        
-        if '4' in self._state:
-            self._attr_brightness = int(self._state['4'] / 4)
-        
-        if '5' in self._state and '6' in self._state:
-            self._attr_hs_color = (int(self._state['5']), int(self._state['6'] / 10))
-        
-        if '3' in self._state:
-            color_temp_mired = 500 - int(self._state['3'] / 2)
-            self._attr_color_temp_kelvin = None
-            if color_temp_mired > 0:
+        self._apply_device_state()
+
+    async def async_update(self) -> None:
+        """Query in a worker and apply the result on the event loop."""
+        sequence_number_before_query = (
+            self._tcp_client.last_state_sequence_number
+        )
+        state = await self.hass.async_add_executor_job(
+            self._tcp_client.query
+        )
+        if not self._state_updates_active:
+            return
+        if (
+            SWITCH not in state
+            and self._tcp_client.last_state_sequence_number
+            == sequence_number_before_query
+        ):
+            self._state.pop(SWITCH, None)
+            self._attr_available = False
+
+    def _merge_device_state(self, state: dict[str, int]) -> None:
+        """Merge changed DPID values while preserving unreported properties."""
+        self._state.update(state)
+
+    def _apply_incremental_state(self, state: dict[str, int]) -> None:
+        """Record one newer state source and update mapped entity fields."""
+        self._merge_device_state(state)
+        self._apply_device_state()
+
+    def _apply_device_state(self) -> None:
+        """Map the cached device properties to Home Assistant light fields."""
+        if SWITCH in self._state:
+            self._attr_is_on = 0 < self._state[SWITCH]
+
+        self._attr_brightness = None
+        if BRIGHT in self._state:
+            self._attr_brightness = int(self._state[BRIGHT] / 4)
+
+        has_hs_color = (
+            HUE in self._state
+            and SAT in self._state
+            and self._state[HUE] != 65535
+            and self._state[SAT] != 65535
+        )
+        self._attr_hs_color = None
+        if has_hs_color:
+            self._attr_hs_color = (
+                int(self._state[HUE]),
+                int(self._state[SAT] / 10),
+            )
+
+        has_color_temperature = (
+            TEMP in self._state and self._state[TEMP] != 65535
+        )
+        self._attr_color_temp_kelvin = None
+        if TEMP in self._state:
+            color_temp_mired = 500 - int(self._state[TEMP] / 2)
+            if has_color_temperature and color_temp_mired > 0:
                 self._attr_color_temp_kelvin = (
                     color_util.color_temperature_mired_to_kelvin(color_temp_mired)
                 )
+
+        if has_hs_color:
+            self._attr_color_mode = ColorMode.HS
+        elif self._attr_color_temp_kelvin is not None:
+            self._attr_color_mode = ColorMode.COLOR_TEMP
+        elif self._attr_supported_color_modes & {
+            ColorMode.COLOR_TEMP,
+            ColorMode.HS,
+        }:
+            self._attr_color_mode = None
+
+    def _handle_state_report(
+        self, state: dict, sequence_number: int
+    ) -> None:
+        """Move device state messages from the network thread to the event loop."""
+        relevant_state = {
+            key: value for key, value in state.items() if key in LIGHT_DPID
+        }
+        if relevant_state and self.hass is not None:
+            self.hass.loop.call_soon_threadsafe(
+                self._apply_state_report,
+                relevant_state,
+                sequence_number,
+            )
+
+    def _apply_state_report(
+        self,
+        state: dict[str, int],
+        sequence_number: int,
+    ) -> None:
+        """Merge one state message and publish all light fields together."""
+        if not self._state_updates_active:
+            return
+        latest_sequence_number = self._tcp_client.last_state_sequence_number
+        if (
+            latest_sequence_number is not None
+            and sequence_number < latest_sequence_number
+        ):
+            return
+        self._apply_incremental_state(state)
+        self._attr_available = SWITCH in self._state
+        if self._initial_query_complete:
+            self.async_write_ha_state()
+
+    async def async_added_to_hass(self) -> None:
+        """Subscribe after Home Assistant can safely receive state writes."""
+        await super().async_added_to_hass()
+        self._state_updates_active = True
+        self._remove_state_callback = self._tcp_client.add_state_callback(
+            self._handle_state_report
+        )
+        await self.async_update()
+        if self._state_updates_active:
+            self._initial_query_complete = True
+
+    async def async_will_remove_from_hass(self) -> None:
+        """Stop transport callbacks before Home Assistant removes the entity."""
+        self._state_updates_active = False
+        if self._remove_state_callback is not None:
+            self._remove_state_callback()
+            self._remove_state_callback = None
+        await super().async_will_remove_from_hass()
 
     def update(self) -> None:
         """Poll the device so an unavailable light can recover."""
@@ -173,8 +292,29 @@ class CozyLifeLight(LightEntity):
         """Return a unique ID."""
         return self._unique_id
 
-    def turn_on(self, **kwargs: Any) -> None:
-        """Turn the entity on."""
+    async def _async_control(self, payload: dict[str, int]) -> bool:
+        """Run device input/output in a worker and own state on the event loop."""
+        try:
+            control_succeeded = await self.hass.async_add_executor_job(
+                self._tcp_client.control,
+                payload,
+            )
+        except DeviceCommandRejectedError as err:
+            raise HomeAssistantError(
+                "CozyLife device rejected command"
+            ) from err
+
+        if not control_succeeded:
+            self._attr_available = False
+            self.async_write_ha_state()
+            raise HomeAssistantError(
+                "Unable to send command to CozyLife device"
+            )
+
+        return True
+
+    async def async_turn_on(self, **kwargs: Any) -> None:
+        """Turn on the light without changing state from a worker thread."""
         brightness = kwargs.get(ATTR_BRIGHTNESS)
         # The existing device mapping uses 153..500 mired.
         color_temp_kelvin = kwargs.get(ATTR_COLOR_TEMP_KELVIN)
@@ -206,51 +346,12 @@ class CozyLifeLight(LightEntity):
             )
             payload['3'] = 1000 - color_temp_mired * 2
         
-        try:
-            control_succeeded = self._tcp_client.control(payload)
-        except DeviceCommandRejectedError as err:
-            raise HomeAssistantError(
-                "CozyLife device rejected command"
-            ) from err
+        await self._async_control(payload)
 
-        if not control_succeeded:
-            self._attr_available = False
-            self.schedule_update_ha_state()
-            raise HomeAssistantError("Unable to send command to CozyLife device")
-
-        self._attr_available = True
-        self._attr_is_on = True
-        if brightness is not None:
-            self._attr_brightness = brightness
-        if hs_color is not None:
-            self._attr_hs_color = hs_color
-            self._attr_color_mode = ColorMode.HS
-        if color_temp_kelvin is not None:
-            self._attr_color_temp_kelvin = color_temp_kelvin
-            self._attr_color_mode = ColorMode.COLOR_TEMP
-        return None
-        raise NotImplementedError()
-    
-    def turn_off(self, **kwargs: Any) -> None:
-        """Turn the entity off."""
+    async def async_turn_off(self, **kwargs: Any) -> None:
+        """Turn off the light without changing state from a worker thread."""
         _LOGGER.info(f'turn_off.kwargs={kwargs}')
-        try:
-            control_succeeded = self._tcp_client.control({'1': 0})
-        except DeviceCommandRejectedError as err:
-            raise HomeAssistantError(
-                "CozyLife device rejected command"
-            ) from err
-
-        if not control_succeeded:
-            self._attr_available = False
-            self.schedule_update_ha_state()
-            raise HomeAssistantError("Unable to send command to CozyLife device")
-        self._attr_available = True
-        self._attr_is_on = False
-        
-        return None
-        
-        raise NotImplementedError()
+        await self._async_control({SWITCH: 0})
     
     @property
     def hs_color(self) -> tuple[float, float] | None:

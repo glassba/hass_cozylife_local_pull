@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import queue
+import socket
 import threading
 import unittest
 from unittest.mock import Mock, patch
@@ -505,6 +506,20 @@ class TransmissionControlProtocolFailureTest(unittest.TestCase):
         self.assertFalse(connection.closed)
         reconnect.assert_not_called()
 
+    def test_query_sends_requested_attributes(self) -> None:
+        """A targeted query sends only the requested device attributes."""
+        connection = RecordingSocket(
+            cmd=CMD_QUERY,
+            response_data={"13": 60},
+        )
+        client = _make_client(connection)
+
+        state = client.query([13])
+
+        self.assertEqual(state, {"13": 60})
+        request = json.loads(connection.payload)
+        self.assertEqual(request["msg"]["attr"], [13])
+
     def test_query_rejection_returns_empty_without_reconnecting(self) -> None:
         """A valid query rejection keeps the protocol connection reusable."""
         connection = RecordingSocket(
@@ -526,7 +541,6 @@ class TransmissionControlProtocolFailureTest(unittest.TestCase):
         """A malformed matching query response invalidates the connection."""
         state = {"1": 1}
         connections = (
-            RecordingSocket(cmd=3, response_data=state),
             RecordingSocket(cmd=False, response_data=state),
             RecordingSocket(cmd=2.0, response_data=state),
             RecordingSocket(
@@ -760,7 +774,6 @@ class TransmissionControlProtocolFailureTest(unittest.TestCase):
     def test_control_invalid_acknowledgement_reconnects(self) -> None:
         """A malformed matching response invalidates the protocol connection."""
         for connection in (
-            RecordingSocket(cmd=2),
             RecordingSocket(cmd=3.0),
             RecordingSocket(include_data=False),
             RecordingSocket(include_res=False),
@@ -816,6 +829,37 @@ class TransmissionControlProtocolFailureTest(unittest.TestCase):
         self.assertTrue(client._stop_event.is_set())
         self.assertTrue(connection.closed)
         self.assertIsNone(client._connect)
+
+    def test_state_listener_starts_inside_lifecycle_lock(self) -> None:
+        """A published listener is already startable by concurrent close."""
+        connection, peer = socket.socketpair()
+        client = _make_client(connection)
+        lifecycle_lock = TrackingRLock()
+        client._lifecycle_lock = lifecycle_lock
+        start_lock_depths: list[int] = []
+
+        class StartObservingThread:
+            """Record the lifecycle lock depth when start is called."""
+
+            def __init__(self, *, target) -> None:
+                self.target = target
+                self.daemon = False
+
+            def start(self) -> None:
+                start_lock_depths.append(lifecycle_lock.depth)
+
+        try:
+            with patch(
+                "custom_components.hass_cozylife_local_pull.tcp_client.threading.Thread",
+                StartObservingThread,
+            ):
+                client._start_state_listener(connection)
+        finally:
+            client._state_listener_thread = None
+            client._interrupt_socket(connection)
+            peer.close()
+
+        self.assertEqual(start_lock_depths, [1])
 
     def test_close_after_handshake_prevents_ready_publication(self) -> None:
         """Closing after a handshake cannot publish stale readiness."""
@@ -2003,8 +2047,23 @@ class TransmissionControlProtocolFailureTest(unittest.TestCase):
             first_sent_sequence = first._only_send(CMD_QUERY, {})
             second_frame, second_sequence = second._get_package(CMD_QUERY, {})
 
-        self.assertEqual(json.loads(first_frame)["sn"], first_sequence)
-        self.assertEqual(first_sequence, "1000")
-        self.assertEqual(first_sent_sequence, "1001")
-        self.assertEqual(json.loads(second_frame)["sn"], second_sequence)
-        self.assertEqual(second_sequence, "1000")
+        self.assertEqual(json.loads(first_frame)["sn"], str(first_sequence))
+        self.assertEqual(first_sequence, 1000)
+        self.assertEqual(first_sent_sequence, 1001)
+        self.assertEqual(json.loads(second_frame)["sn"], str(second_sequence))
+        self.assertEqual(second_sequence, 1000)
+
+    def test_request_sequence_advances_past_device_state_sequence(self) -> None:
+        """A request remains newer than an accepted device state timestamp."""
+        with patch.object(tcp_client, "_reconnect"):
+            client = tcp_client("192.0.2.1")
+        client._last_state_sequence_number = 2000
+
+        with patch(
+            "custom_components.hass_cozylife_local_pull.tcp_client.get_sn",
+            return_value="1000",
+        ):
+            frame, sequence_number = client._get_package(CMD_QUERY, {})
+
+        self.assertEqual(sequence_number, 2001)
+        self.assertEqual(json.loads(frame)["sn"], "2001")

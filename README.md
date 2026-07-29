@@ -23,6 +23,16 @@ hass_cozylife_local_pull:
      - "192.168.1.99"
 ```
 
+Countdown entities publish their locally calculated remaining seconds once per
+second while active. Exclude them from Recorder to avoid storing every tick:
+
+```yaml
+recorder:
+  exclude:
+    entity_globs:
+      - number.*_countdown
+```
+
 
 ### Feedback
 * Please submit an issue

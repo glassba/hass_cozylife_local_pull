@@ -12,7 +12,7 @@ import threading
 import unittest
 from unittest.mock import Mock, patch
 
-from custom_components.hass_cozylife_local_pull import light, switch
+from custom_components.hass_cozylife_local_pull import light, number, switch
 from custom_components.hass_cozylife_local_pull.const import (
     DOMAIN,
     LIGHT_TYPE_CODE,
@@ -25,7 +25,7 @@ class DelayedDeviceClient:
 
     device_id = "device-1234"
     device_model_name = "Test Device"
-    dpid = [1, 4]
+    dpid = [1, 4, 13]
 
     def __init__(self, device_type_code: str | type = str) -> None:
         self.device_type_code = device_type_code
@@ -57,9 +57,9 @@ class DelayedDeviceClient:
             for callback in callbacks:
                 callback(self)
 
-    def query(self) -> dict[str, int]:
+    def query(self, attributes: list[int] | None = None) -> dict[str, int]:
         """Return a complete state for either supported entity type."""
-        return {"1": 0, "4": 0}
+        return {"1": 0, "4": 0, "13": 0}
 
     def control(self, payload: dict[str, int]) -> bool:
         """Accept entity commands used during setup tests."""
@@ -241,7 +241,7 @@ class StartupReadinessTest(unittest.TestCase):
         time_module.sleep.assert_not_called()
         self.assertEqual(
             [call.args[1] for call in load_platform.call_args_list],
-            ["light", "switch"],
+            ["light", "switch", "number"],
         )
         self.assertTrue(all(inspect.isawaitable(load) for load in platform_loads))
         self.assertEqual(hass.loop.scheduled, [()])
@@ -1143,6 +1143,7 @@ class StartupReadinessTest(unittest.TestCase):
         cases = (
             (light, LIGHT_TYPE_CODE, light.CozyLifeLight),
             (switch, SWITCH_TYPE_CODE, switch.CozyLifeSwitch),
+            (number, LIGHT_TYPE_CODE, number.CozyLifeLightCountdown),
         )
 
         for platform, device_type_code, entity_type in cases:
@@ -1166,6 +1167,7 @@ class StartupReadinessTest(unittest.TestCase):
         cases = (
             (light, LIGHT_TYPE_CODE, light.CozyLifeLight),
             (switch, SWITCH_TYPE_CODE, switch.CozyLifeSwitch),
+            (number, LIGHT_TYPE_CODE, number.CozyLifeLightCountdown),
         )
 
         for platform, device_type_code, entity_type in cases:
@@ -1187,6 +1189,7 @@ class StartupReadinessTest(unittest.TestCase):
         cases = (
             (light, LIGHT_TYPE_CODE, light.CozyLifeLight),
             (switch, SWITCH_TYPE_CODE, switch.CozyLifeSwitch),
+            (number, LIGHT_TYPE_CODE, number.CozyLifeLightCountdown),
         )
 
         for platform, device_type_code, entity_type in cases:
@@ -1212,6 +1215,7 @@ class StartupReadinessTest(unittest.TestCase):
         cases = (
             (light, SWITCH_TYPE_CODE),
             (switch, LIGHT_TYPE_CODE),
+            (number, SWITCH_TYPE_CODE),
         )
 
         for platform, device_type_code in cases:
@@ -1226,3 +1230,17 @@ class StartupReadinessTest(unittest.TestCase):
 
                 self.assertEqual(client.registration_count, 1)
                 self.assertEqual(added_entities, [])
+
+    def test_countdown_platform_ignores_light_without_dpid_13(self) -> None:
+        """A light without countdown capability gets no number entity."""
+        client = DelayedDeviceClient(LIGHT_TYPE_CODE)
+        client.dpid = [1, 4]
+        hass = RecordingHomeAssistant([client])
+        added_entities = []
+
+        number.setup_platform(
+            hass, {}, added_entities.extend, discovery_info={}
+        )
+
+        self.assertEqual(client.registration_count, 1)
+        self.assertEqual(added_entities, [])

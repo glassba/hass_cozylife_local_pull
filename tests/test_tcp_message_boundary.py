@@ -16,11 +16,15 @@ from __future__ import annotations
 
 import json
 import queue
+import socket
 import threading
 import unittest
 from unittest.mock import patch
 
-from custom_components.hass_cozylife_local_pull.tcp_client import tcp_client
+from custom_components.hass_cozylife_local_pull.tcp_client import (
+    DeviceCommandRejectedError,
+    tcp_client,
+)
 
 TEST_TIMEOUT = 5
 
@@ -111,6 +115,24 @@ class MergedRecvSocket:
             return b""
         self._served = True
         return self._merged
+
+
+class FirstReceiveObservedSocket:
+    """Wrap a real socket and expose when its first receive has completed."""
+
+    def __init__(self, connection: socket.socket) -> None:
+        self._connection = connection
+        self.first_receive_completed = threading.Event()
+
+    def recv(self, bufsize: int) -> bytes:
+        """Delegate receive and publish that the listener consumed a fragment."""
+        data = self._connection.recv(bufsize)
+        self.first_receive_completed.set()
+        return data
+
+    def __getattr__(self, name):
+        """Delegate the remaining socket interface to the real connection."""
+        return getattr(self._connection, name)
 
 
 class FiniteUnmatchedSocket:
@@ -282,6 +304,32 @@ class TransmissionControlProtocolMessageBoundaryTest(unittest.TestCase):
 
         self.assertEqual(client._device_id, VALID_INFO_RESPONSE["msg"]["did"])
 
+    def test_device_info_matches_numeric_response_sequence(self) -> None:
+        """A numeric response timestamp matches the string sent on the wire."""
+        response = {
+            **VALID_INFO_RESPONSE,
+            "sn": int(VALID_INFO_RESPONSE["sn"]),
+        }
+        client = _make_client(MergedRecvSocket(_frame(response)))
+        client._device_id = str
+        client._pid = str
+        client._device_type_code = str
+        client._icon = str
+        client._device_model_name = str
+        client._dpid = []
+
+        with patch(
+            "custom_components.hass_cozylife_local_pull.tcp_client.get_pid_list",
+            return_value=VALID_PID_LIST,
+        ), patch(
+            "custom_components.hass_cozylife_local_pull.tcp_client.get_sn",
+            return_value=VALID_INFO_RESPONSE["sn"],
+        ):
+            handshake_succeeded = client._device_info()
+
+        self.assertTrue(handshake_succeeded)
+        self.assertEqual(client._device_id, VALID_INFO_RESPONSE["msg"]["did"])
+
     def test_device_info_shares_one_send_receive_deadline(self) -> None:
         """Handshake send and fragmented receives consume one timeout budget."""
         full = _frame(VALID_INFO_RESPONSE)
@@ -339,37 +387,53 @@ class TransmissionControlProtocolMessageBoundaryTest(unittest.TestCase):
         self.assertEqual(client._device_id, VALID_INFO_RESPONSE["msg"]["did"])
         self.assertEqual(client._receive_buffer, frame)
 
-    def test_device_info_skips_an_unmatched_frame(self) -> None:
-        """An unsolicited update cannot replace the handshake response."""
-        unsolicited_response = {
-            "cmd": 10,
-            "pv": 0,
-            "sn": "unmatched",
-            "msg": {"attr": [1], "data": {"1": 255}},
-            "res": 0,
-        }
-        sock = MergedRecvSocket(
-            _frame(unsolicited_response) + _frame(VALID_INFO_RESPONSE)
-        )
-        client = _make_client(sock)
-        client._device_id = str
-        client._pid = str
-        client._device_type_code = str
-        client._icon = str
-        client._device_model_name = str
-        client._dpid = []
+    def test_device_info_processes_interleaved_state_commands(self) -> None:
+        """Handshake input records cmd 2, cmd 3, and cmd 10 state frames."""
+        for command in (2, 3, 10):
+            with self.subTest(command=command):
+                state_response = {
+                    "cmd": command,
+                    "pv": 0,
+                    "sn": "1700000000000",
+                    "msg": {"attr": [1], "data": {"1": 255}},
+                }
+                if command in (2, 3):
+                    state_response["res"] = 0
+                sock = MergedRecvSocket(
+                    _frame(state_response) + _frame(VALID_INFO_RESPONSE)
+                )
+                client = _make_client(sock)
+                client._device_id = str
+                client._pid = str
+                client._device_type_code = str
+                client._icon = str
+                client._device_model_name = str
+                client._dpid = []
+                received_updates: list[tuple[dict, int]] = []
+                client.add_state_callback(
+                    lambda state, sequence_number: received_updates.append(
+                        (state, sequence_number)
+                    )
+                )
 
-        with patch(
-            "custom_components.hass_cozylife_local_pull.tcp_client.get_pid_list",
-            return_value=VALID_PID_LIST,
-        ), patch(
-            "custom_components.hass_cozylife_local_pull.tcp_client.get_sn",
-            return_value=VALID_INFO_RESPONSE["sn"],
-        ):
-            handshake_succeeded = client._device_info()
+                with patch(
+                    "custom_components.hass_cozylife_local_pull.tcp_client.get_pid_list",
+                    return_value=VALID_PID_LIST,
+                ), patch(
+                    "custom_components.hass_cozylife_local_pull.tcp_client.get_sn",
+                    return_value=VALID_INFO_RESPONSE["sn"],
+                ):
+                    handshake_succeeded = client._device_info()
 
-        self.assertTrue(handshake_succeeded)
-        self.assertEqual(client._device_id, VALID_INFO_RESPONSE["msg"]["did"])
+                self.assertTrue(handshake_succeeded)
+                self.assertEqual(
+                    client._device_id,
+                    VALID_INFO_RESPONSE["msg"]["did"],
+                )
+                self.assertEqual(
+                    received_updates,
+                    [({"1": 255}, 1700000000000)],
+                )
 
     def test_oversized_undelimited_frame_is_rejected_without_an_extra_receive(
         self,
@@ -427,6 +491,843 @@ class TransmissionControlProtocolMessageBoundaryTest(unittest.TestCase):
         self.assertEqual(first_result, {"1": 0})
         self.assertEqual(second_result, {"1": 255})
         reconnect.assert_not_called()
+
+    def test_query_dispatches_state_data_with_sequence_number(self) -> None:
+        """A valid query response publishes its data and device timestamp."""
+        response = {
+            "cmd": 2,
+            "pv": 0,
+            "sn": "1700000000000",
+            "msg": {"attr": [1], "data": {"1": 255}},
+            "res": 0,
+        }
+        client = _make_client(MergedRecvSocket(_frame(response)))
+        received_updates: list[tuple[dict, int]] = []
+        client.add_state_callback(
+            lambda state, sequence_number: received_updates.append(
+                (state, sequence_number)
+            )
+        )
+
+        with patch(
+            "custom_components.hass_cozylife_local_pull.tcp_client.get_sn",
+            return_value=response["sn"],
+        ):
+            query_result = client.query()
+
+        self.assertEqual(query_result, {"1": 255})
+        self.assertEqual(
+            received_updates,
+            [({"1": 255}, 1700000000000)],
+        )
+
+    def test_query_matches_numeric_response_sequence(self) -> None:
+        """A numeric query response timestamp completes the string request."""
+        response = {
+            "cmd": 2,
+            "pv": 0,
+            "sn": 1700000000000,
+            "msg": {"attr": [1], "data": {"1": 255}},
+            "res": 0,
+        }
+        client = _make_client(MergedRecvSocket(_frame(response)))
+
+        with patch(
+            "custom_components.hass_cozylife_local_pull.tcp_client.get_sn",
+            return_value="1700000000000",
+        ), patch.object(client, "_reconnect") as reconnect:
+            query_result = client.query()
+
+        self.assertEqual(query_result, {"1": 255})
+        reconnect.assert_not_called()
+
+    def test_newer_report_discards_older_query_response(self) -> None:
+        """A queued query snapshot cannot replace a newer device report."""
+        report = {
+            "cmd": 10,
+            "pv": 0,
+            "sn": "1700000000001",
+            "msg": {"attr": [1], "data": {"1": 255}},
+            "res": 0,
+        }
+        response = {
+            "cmd": 2,
+            "pv": 0,
+            "sn": "1700000000000",
+            "msg": {"attr": [1], "data": {"1": 0}},
+            "res": 0,
+        }
+        client = _make_client(
+            MergedRecvSocket(_frame(report) + _frame(response))
+        )
+        received_updates: list[tuple[dict, int]] = []
+        client.add_state_callback(
+            lambda state, sequence_number: received_updates.append(
+                (state, sequence_number)
+            )
+        )
+
+        with patch(
+            "custom_components.hass_cozylife_local_pull.tcp_client.get_sn",
+            return_value=response["sn"],
+        ):
+            query_result = client.query()
+
+        self.assertEqual(query_result, {})
+        self.assertEqual(
+            received_updates,
+            [({"1": 255}, 1700000000001)],
+        )
+        self.assertEqual(client.last_state_sequence_number, 1700000000001)
+
+    def test_control_dispatches_acknowledged_state(self) -> None:
+        """A valid control acknowledgement publishes authoritative state."""
+        response = {
+            "cmd": 3,
+            "pv": 0,
+            "sn": "1700000000000",
+            "msg": {"attr": [1], "data": {"1": 255}},
+            "res": 0,
+        }
+        client = _make_client(MergedRecvSocket(_frame(response)))
+        received_updates: list[tuple[dict, int]] = []
+        client.add_state_callback(
+            lambda state, sequence_number: received_updates.append(
+                (state, sequence_number)
+            )
+        )
+
+        with patch(
+            "custom_components.hass_cozylife_local_pull.tcp_client.get_sn",
+            return_value=response["sn"],
+        ):
+            control_result = client.control({"1": 255})
+
+        self.assertTrue(control_result)
+        self.assertEqual(
+            received_updates,
+            [({"1": 255}, 1700000000000)],
+        )
+
+    def test_control_matches_numeric_response_sequence(self) -> None:
+        """A numeric control response timestamp completes the string request."""
+        response = {
+            "cmd": 3,
+            "pv": 0,
+            "sn": 1700000000000,
+            "msg": {"attr": [1], "data": {"1": 255}},
+            "res": 0,
+        }
+        client = _make_client(MergedRecvSocket(_frame(response)))
+
+        with patch(
+            "custom_components.hass_cozylife_local_pull.tcp_client.get_sn",
+            return_value="1700000000000",
+        ), patch.object(client, "_reconnect") as reconnect:
+            control_result = client.control({"1": 255})
+
+        self.assertTrue(control_result)
+        reconnect.assert_not_called()
+
+    def test_query_processes_interleaved_control_state(self) -> None:
+        """A control reply updates state without completing an active query."""
+        control_response = {
+            "cmd": 3,
+            "pv": 0,
+            "sn": "1700000000000",
+            "msg": {"attr": [13], "data": {"13": 5}},
+            "res": 0,
+        }
+        query_response = {
+            "cmd": 2,
+            "pv": 0,
+            "sn": "1700000000000",
+            "msg": {"attr": [1], "data": {"1": 0}},
+            "res": 0,
+        }
+        client = _make_client(
+            MergedRecvSocket(
+                _frame(control_response) + _frame(query_response)
+            )
+        )
+        received_updates: list[tuple[dict, int]] = []
+        client.add_state_callback(
+            lambda state, sequence_number: received_updates.append(
+                (state, sequence_number)
+            )
+        )
+
+        with patch(
+            "custom_components.hass_cozylife_local_pull.tcp_client.get_sn",
+            return_value=query_response["sn"],
+        ), patch.object(client, "_reconnect") as reconnect:
+            query_result = client.query()
+
+        self.assertEqual(query_result, {"1": 0})
+        self.assertEqual(
+            received_updates,
+            [
+                ({"13": 5, "1": 0}, 1700000000000),
+            ],
+        )
+        reconnect.assert_not_called()
+
+    def test_control_processes_interleaved_query_state(self) -> None:
+        """A query reply updates state without completing an active control."""
+        query_response = {
+            "cmd": 2,
+            "pv": 0,
+            "sn": "1700000000000",
+            "msg": {"attr": [13], "data": {"13": 5}},
+            "res": 0,
+        }
+        control_response = {
+            "cmd": 3,
+            "pv": 0,
+            "sn": "1700000000000",
+            "msg": {"attr": [1], "data": {"1": 255}},
+            "res": 0,
+        }
+        client = _make_client(
+            MergedRecvSocket(
+                _frame(query_response) + _frame(control_response)
+            )
+        )
+        received_updates: list[tuple[dict, int]] = []
+        client.add_state_callback(
+            lambda state, sequence_number: received_updates.append(
+                (state, sequence_number)
+            )
+        )
+
+        with patch(
+            "custom_components.hass_cozylife_local_pull.tcp_client.get_sn",
+            return_value=control_response["sn"],
+        ), patch.object(client, "_reconnect") as reconnect:
+            control_result = client.control({"1": 255})
+
+        self.assertTrue(control_result)
+        self.assertEqual(
+            received_updates,
+            [
+                ({"13": 5, "1": 255}, 1700000000000),
+            ],
+        )
+        reconnect.assert_not_called()
+
+    def test_equal_sequence_number_merges_state_responses(self) -> None:
+        """Multiple state frames from one timestamp are merged before dispatch."""
+        report = {
+            "cmd": 10,
+            "pv": 0,
+            "sn": "1700000000000",
+            "msg": {"attr": [4], "data": {"4": 200}},
+        }
+        response = {
+            "cmd": 2,
+            "pv": 0,
+            "sn": "1700000000000",
+            "msg": {"attr": [1], "data": {"1": 255}},
+            "res": 0,
+        }
+        client = _make_client(
+            MergedRecvSocket(_frame(report) + _frame(response))
+        )
+        received_updates: list[tuple[dict, int]] = []
+        client.add_state_callback(
+            lambda state, sequence_number: received_updates.append(
+                (state, sequence_number)
+            )
+        )
+
+        with patch(
+            "custom_components.hass_cozylife_local_pull.tcp_client.get_sn",
+            return_value=response["sn"],
+        ):
+            query_result = client.query()
+
+        self.assertEqual(query_result, {"1": 255})
+        self.assertEqual(
+            received_updates,
+            [
+                ({"4": 200, "1": 255}, 1700000000000),
+            ],
+        )
+
+    def test_state_commands_share_one_sequence_order(self) -> None:
+        """All state commands use one global sequence number order."""
+        client = _make_client(None)
+        received_updates: list[tuple[dict, int]] = []
+        client.add_state_callback(
+            lambda state, sequence_number: received_updates.append(
+                (state, sequence_number)
+            )
+        )
+        older_response = {
+            "cmd": 2,
+            "pv": 0,
+            "sn": "1700000000000",
+            "msg": {"attr": [1], "data": {"1": 0}},
+            "res": 0,
+        }
+        newer_response = {
+            "cmd": 3,
+            "pv": 0,
+            "sn": "1700000000001",
+            "msg": {"attr": [1], "data": {"1": 255}},
+            "res": 0,
+        }
+        equal_response = {
+            "cmd": 10,
+            "pv": 0,
+            "sn": "1700000000001",
+            "msg": {"attr": [13], "data": {"13": 20}},
+        }
+
+        self.assertTrue(client._queue_state_response(older_response))
+        self.assertTrue(client._queue_state_response(newer_response))
+        self.assertTrue(client._queue_state_response(equal_response))
+        client._drain_state_reports()
+
+        self.assertEqual(
+            received_updates,
+            [
+                ({"1": 255, "13": 20}, 1700000000001),
+            ],
+        )
+
+    def test_unknown_command_is_not_queued_as_state(self) -> None:
+        """Only cmd 2, cmd 3, and cmd 10 can publish device state."""
+        client = _make_client(None)
+        response = {
+            "cmd": 0,
+            "pv": 0,
+            "sn": "1700000000000",
+            "msg": {"data": {"1": 255}},
+            "res": 0,
+        }
+
+        self.assertFalse(client._queue_state_response(response))
+        self.assertIsNone(client.last_state_sequence_number)
+
+    def test_rejected_reply_logs_and_discards_state_payload(self) -> None:
+        """Nonzero cmd 2 and cmd 3 results never publish their payload."""
+        for command in (2, 3):
+            with self.subTest(command=command):
+                client = _make_client(None)
+                response = {
+                    "cmd": command,
+                    "pv": 0,
+                    "sn": "1700000000000",
+                    "msg": {"data": {"1": 255}},
+                    "res": 1,
+                }
+
+                with self.assertLogs(
+                    "custom_components.hass_cozylife_local_pull.tcp_client",
+                    level="INFO",
+                ) as logs:
+                    queued = client._queue_state_response(response)
+
+                self.assertFalse(queued)
+                self.assertIsNone(client.last_state_sequence_number)
+                self.assertTrue(
+                    any(
+                        f"cmd={command}" in message
+                        and "sn=1700000000000" in message
+                        and "res=1" in message
+                        for message in logs.output
+                    )
+                )
+
+    def test_invalid_report_sequence_number_is_ignored(self) -> None:
+        """Malformed report timestamps cannot affect accepted state order."""
+        response = {
+            "cmd": 2,
+            "pv": 0,
+            "sn": "1700000000000",
+            "msg": {"attr": [1], "data": {"1": 255}},
+            "res": 0,
+        }
+        for invalid_sequence_number in ("invalid", True, -1, None, 1.5):
+            with self.subTest(sequence_number=invalid_sequence_number):
+                invalid_report = {
+                    "cmd": 10,
+                    "pv": 0,
+                    "sn": invalid_sequence_number,
+                    "msg": {"attr": [1], "data": {"1": 0}},
+                    "res": 0,
+                }
+                client = _make_client(
+                    MergedRecvSocket(
+                        _frame(invalid_report) + _frame(response)
+                    )
+                )
+                received_updates: list[tuple[dict, int]] = []
+                client.add_state_callback(
+                    lambda state, sequence_number: received_updates.append(
+                        (state, sequence_number)
+                    )
+                )
+
+                with patch(
+                    "custom_components.hass_cozylife_local_pull.tcp_client.get_sn",
+                    return_value=response["sn"],
+                ):
+                    query_result = client.query()
+
+                self.assertEqual(query_result, {"1": 255})
+                self.assertEqual(
+                    received_updates,
+                    [({"1": 255}, 1700000000000)],
+                )
+
+    def test_newer_query_response_discards_older_active_report(self) -> None:
+        """A newer query response discards an older queued active report."""
+        report = {
+            "cmd": 10,
+            "pv": 0,
+            "sn": "999",
+            "msg": {
+                "attr": [1, 4, 5, 6, 13],
+                "data": {"1": 255, "4": 400, "5": 120, "6": 500, "13": 30},
+            },
+            "res": 0,
+        }
+        response = {
+            "cmd": 2,
+            "pv": 0,
+            "sn": "1000",
+            "msg": {"attr": [1], "data": {"1": 255}},
+            "res": 0,
+        }
+        client = _make_client(
+            MergedRecvSocket(_frame(report) + _frame(response))
+        )
+        received_reports: list[dict] = []
+        client.add_state_callback(
+            lambda state, _sequence_number: received_reports.append(state)
+        )
+
+        with patch(
+            "custom_components.hass_cozylife_local_pull.tcp_client.get_sn",
+            return_value="1000",
+        ):
+            query_result = client.query()
+
+        self.assertEqual(query_result, {"1": 255})
+        self.assertEqual(
+            received_reports,
+            [response["msg"]["data"]],
+        )
+
+    def test_state_listener_hands_socket_to_query_without_losing_report(
+        self,
+    ) -> None:
+        """A live listener yields to a query and drops its older report."""
+        client_socket, device_socket = socket.socketpair()
+        client = _make_client(client_socket)
+        report_received = threading.Event()
+        received_reports: list[dict] = []
+        query_results: queue.Queue[dict] = queue.Queue()
+        query_errors: queue.Queue[BaseException] = queue.Queue()
+        query_thread = None
+
+        def receive_report(state: dict, _sequence_number: int) -> None:
+            received_reports.append(state)
+            report_received.set()
+
+        def query() -> None:
+            try:
+                query_results.put(client.query([13]))
+            except BaseException as err:
+                query_errors.put(err)
+
+        try:
+            client.add_state_callback(receive_report)
+            client._start_state_listener(client_socket)
+            self.assertIsNotNone(client._state_listener_thread)
+            self.assertTrue(client._state_listener_thread.is_alive())
+
+            query_thread = threading.Thread(target=query, daemon=True)
+            query_thread.start()
+            device_socket.settimeout(TEST_TIMEOUT)
+            request_data = b""
+            while b"\r\n" not in request_data:
+                chunk = device_socket.recv(4096)
+                if not chunk:
+                    self.fail("Query socket closed before sending a request")
+                request_data += chunk
+            request = json.loads(request_data.split(b"\r\n", 1)[0])
+
+            report = {
+                "cmd": 10,
+                "pv": 0,
+                "sn": str(int(request["sn"]) - 1),
+                "msg": {"attr": [13], "data": {"13": 20}},
+                "res": 0,
+            }
+            response = {
+                "cmd": 2,
+                "pv": 0,
+                "sn": request["sn"],
+                "msg": {"attr": [13], "data": {"13": 19}},
+                "res": 0,
+            }
+            device_socket.sendall(_frame(report) + _frame(response))
+
+            query_thread.join(TEST_TIMEOUT)
+            self.assertFalse(query_thread.is_alive())
+            self.assertTrue(query_errors.empty())
+            self.assertEqual(query_results.get_nowait(), {"13": 19})
+            self.assertTrue(report_received.wait(TEST_TIMEOUT))
+            self.assertEqual(received_reports, [{"13": 19}])
+        finally:
+            client.close()
+            device_socket.close()
+            if query_thread is not None:
+                query_thread.join(TEST_TIMEOUT)
+
+    def test_state_listener_preserves_report_before_control_rejection(
+        self,
+    ) -> None:
+        """A valid report is dispatched even when the following command is rejected."""
+        client_socket, device_socket = socket.socketpair()
+        client = _make_client(client_socket)
+        report_received = threading.Event()
+        received_reports: list[dict] = []
+        control_errors: queue.Queue[BaseException] = queue.Queue()
+        control_thread = None
+
+        def receive_report(state: dict, _sequence_number: int) -> None:
+            received_reports.append(state)
+            report_received.set()
+
+        def control() -> None:
+            try:
+                client.control({"13": 30})
+            except BaseException as err:
+                control_errors.put(err)
+
+        try:
+            client.add_state_callback(receive_report)
+            client._start_state_listener(client_socket)
+            control_thread = threading.Thread(target=control, daemon=True)
+            control_thread.start()
+            device_socket.settimeout(TEST_TIMEOUT)
+            request_data = b""
+            while b"\r\n" not in request_data:
+                chunk = device_socket.recv(4096)
+                if not chunk:
+                    self.fail("Control socket closed before sending a request")
+                request_data += chunk
+            request = json.loads(request_data.split(b"\r\n", 1)[0])
+            report = {
+                "cmd": 10,
+                "pv": 0,
+                "sn": str(int(request["sn"]) - 1),
+                "msg": {"attr": [13], "data": {"13": 5}},
+                "res": 0,
+            }
+            rejection = {
+                "cmd": 3,
+                "pv": 0,
+                "sn": request["sn"],
+                "res": 1,
+            }
+            device_socket.sendall(_frame(report) + _frame(rejection))
+
+            control_thread.join(TEST_TIMEOUT)
+            self.assertFalse(control_thread.is_alive())
+            error = control_errors.get_nowait()
+            self.assertIsInstance(error, DeviceCommandRejectedError)
+            self.assertTrue(report_received.wait(TEST_TIMEOUT))
+            self.assertEqual(received_reports, [{"13": 5}])
+        finally:
+            client.close()
+            device_socket.close()
+            if control_thread is not None:
+                control_thread.join(TEST_TIMEOUT)
+
+    def test_partial_idle_report_releases_socket_for_query(self) -> None:
+        """An incomplete older report releases the socket and is discarded."""
+        raw_client_socket, device_socket = socket.socketpair()
+        client_socket = FirstReceiveObservedSocket(raw_client_socket)
+        client = _make_client(client_socket)
+        report_received = threading.Event()
+        received_reports: list[dict] = []
+        query_results: queue.Queue[dict] = queue.Queue()
+        query_errors: queue.Queue[BaseException] = queue.Queue()
+        query_thread = None
+        report = {
+            "cmd": 10,
+            "pv": 0,
+            "sn": "999",
+            "msg": {"attr": [13], "data": {"13": 20}},
+            "res": 0,
+        }
+        report_frame = _frame(report)
+        split_at = len(report_frame) // 2
+
+        def receive_report(state: dict, _sequence_number: int) -> None:
+            received_reports.append(state)
+            report_received.set()
+
+        def query() -> None:
+            try:
+                query_results.put(client.query([13]))
+            except BaseException as err:
+                query_errors.put(err)
+
+        def receive_request() -> dict:
+            request_data = b""
+            while b"\r\n" not in request_data:
+                chunk = device_socket.recv(4096)
+                if not chunk:
+                    self.fail("Query socket closed before sending a request")
+                request_data += chunk
+            return json.loads(request_data.split(b"\r\n", 1)[0])
+
+        try:
+            client.add_state_callback(receive_report)
+            client._start_state_listener(client_socket)
+            device_socket.sendall(report_frame[:split_at])
+            self.assertTrue(
+                client_socket.first_receive_completed.wait(TEST_TIMEOUT)
+            )
+
+            query_thread = threading.Thread(target=query, daemon=True)
+            query_thread.start()
+            device_socket.settimeout(TEST_TIMEOUT)
+            request_sent_before_remainder = True
+            try:
+                request = receive_request()
+            except TimeoutError:
+                request_sent_before_remainder = False
+                device_socket.sendall(report_frame[split_at:])
+                device_socket.settimeout(TEST_TIMEOUT)
+                request = receive_request()
+
+            response = {
+                "cmd": 2,
+                "pv": 0,
+                "sn": request["sn"],
+                "msg": {"attr": [13], "data": {"13": 19}},
+                "res": 0,
+            }
+            if request_sent_before_remainder:
+                device_socket.sendall(
+                    report_frame[split_at:] + _frame(response)
+                )
+            else:
+                device_socket.sendall(_frame(response))
+
+            query_thread.join(TEST_TIMEOUT)
+            self.assertFalse(query_thread.is_alive())
+            self.assertTrue(query_errors.empty())
+            self.assertEqual(query_results.get_nowait(), {"13": 19})
+            self.assertTrue(report_received.wait(TEST_TIMEOUT))
+            self.assertEqual(received_reports, [{"13": 19}])
+            self.assertTrue(request_sent_before_remainder)
+        finally:
+            client.close()
+            device_socket.close()
+            if query_thread is not None:
+                query_thread.join(TEST_TIMEOUT)
+
+    def test_idle_connection_dispatches_every_state_command(self) -> None:
+        """Idle cmd 2, cmd 3, and cmd 10 frames all publish state."""
+        client_socket, device_socket = socket.socketpair()
+        client = _make_client(client_socket)
+        report_received = threading.Event()
+        received_reports: list[dict] = []
+
+        def receive_report(state: dict, _sequence_number: int) -> None:
+            received_reports.append(state)
+            if state.get("sentinel") == 1:
+                report_received.set()
+
+        try:
+            client.add_state_callback(receive_report)
+            client._start_state_listener(client_socket)
+            query_response = {
+                "cmd": 2,
+                "pv": 0,
+                "sn": "1700000000000",
+                "msg": {"attr": [1], "data": {"1": 0}},
+                "res": 0,
+            }
+            control_response = {
+                "cmd": 3,
+                "pv": 0,
+                "sn": "1700000000000",
+                "msg": {"attr": [13], "data": {"13": 20}},
+                "res": 0,
+            }
+            report = {
+                "cmd": 10,
+                "pv": 0,
+                "sn": "1700000000000",
+                "msg": {"attr": [99], "data": {"sentinel": 1}},
+            }
+            device_socket.sendall(
+                _frame(query_response)
+                + _frame(control_response)
+                + _frame(report)
+            )
+
+            self.assertTrue(report_received.wait(TEST_TIMEOUT))
+            self.assertEqual(
+                received_reports,
+                [{"1": 0, "13": 20, "sentinel": 1}],
+            )
+        finally:
+            client.close()
+            device_socket.close()
+
+    def test_idle_connection_dispatches_complete_report_before_eof(self) -> None:
+        """A complete state frame is published before EOF starts recovery."""
+        client_socket, device_socket = socket.socketpair()
+        client = _make_client(client_socket)
+        received_reports: list[dict] = []
+        reconnect_started = threading.Event()
+        report = {
+            "cmd": 10,
+            "pv": 0,
+            "sn": "1700000000000",
+            "msg": {"attr": [13], "data": {"13": 20}},
+        }
+
+        try:
+            client.add_state_callback(
+                lambda state, _sequence_number: received_reports.append(state)
+            )
+            device_socket.sendall(_frame(report))
+            device_socket.shutdown(socket.SHUT_WR)
+            with patch.object(
+                client, "_reconnect", side_effect=reconnect_started.set
+            ):
+                client._start_state_listener(client_socket)
+                self.assertTrue(reconnect_started.wait(TEST_TIMEOUT))
+
+            self.assertEqual(received_reports, [{"13": 20}])
+        finally:
+            client.close()
+            device_socket.close()
+
+    def test_unsubscribe_waits_for_in_flight_state_callback(self) -> None:
+        """Unsubscribe returns only after an admitted callback has finished."""
+        client = _make_client(None)
+        callback_started = threading.Event()
+        allow_callback = threading.Event()
+        callback_timed_out = threading.Event()
+        remove_started = threading.Event()
+        remove_finished = threading.Event()
+        callback_calls = []
+        callback_lock = ObservableRLock()
+        client._state_callback_lock = callback_lock
+
+        def receive_report(state: dict, _sequence_number: int) -> None:
+            callback_calls.append(state)
+            callback_started.set()
+            if not allow_callback.wait(TEST_TIMEOUT):
+                callback_timed_out.set()
+                raise TimeoutError("State callback was not released")
+
+        remove_callback = client.add_state_callback(receive_report)
+
+        def remove_subscription() -> None:
+            remove_started.set()
+            remove_callback()
+            remove_finished.set()
+
+        dispatch_thread = threading.Thread(
+            target=client._dispatch_state_reports,
+            args=([({"1": 255}, 1700000000000)],),
+            daemon=True,
+        )
+        remove_thread = threading.Thread(
+            target=remove_subscription,
+            daemon=True,
+        )
+        dispatch_thread.start()
+        try:
+            self.assertTrue(callback_started.wait(TEST_TIMEOUT))
+            remove_thread.start()
+            self.assertTrue(remove_started.wait(TEST_TIMEOUT))
+            self.assertTrue(
+                callback_lock.contender_waiting.wait(TEST_TIMEOUT)
+            )
+            self.assertFalse(remove_finished.is_set())
+        finally:
+            allow_callback.set()
+            dispatch_thread.join(TEST_TIMEOUT)
+            if remove_thread.ident is not None:
+                remove_thread.join(TEST_TIMEOUT)
+
+        client._dispatch_state_reports([({"1": 0}, 1700000000001)])
+        self.assertFalse(dispatch_thread.is_alive())
+        self.assertFalse(remove_thread.is_alive())
+        self.assertTrue(remove_finished.is_set())
+        self.assertFalse(callback_timed_out.is_set())
+        self.assertEqual(callback_calls, [{"1": 255}])
+
+    def test_state_report_queue_preserves_order_across_drainers(self) -> None:
+        """Concurrent drainers publish reports in socket receive order."""
+        client = _make_client(None)
+        self.assertTrue(hasattr(client, "_queue_state_report"))
+        self.assertTrue(hasattr(client, "_drain_state_reports"))
+        first_callback_started = threading.Event()
+        allow_first_callback = threading.Event()
+        second_report_queued = threading.Event()
+        second_callback_started = threading.Event()
+        received_reports = []
+        dispatch_lock = ObservableRLock()
+        client._state_report_dispatch_lock = dispatch_lock
+
+        def receive_report(state: dict, _sequence_number: int) -> None:
+            received_reports.append(state)
+            if state == {"1": 1}:
+                first_callback_started.set()
+                if not allow_first_callback.wait(TEST_TIMEOUT):
+                    raise TimeoutError("First report callback was not released")
+            elif state == {"1": 2}:
+                second_callback_started.set()
+
+        client.add_state_callback(receive_report)
+        client._queue_state_report({"1": 1}, 1700000000000)
+        first_drainer = threading.Thread(
+            target=client._drain_state_reports,
+            daemon=True,
+        )
+
+        def queue_and_drain_second_report() -> None:
+            client._queue_state_report({"1": 2}, 1700000000001)
+            second_report_queued.set()
+            client._drain_state_reports()
+
+        second_drainer = threading.Thread(
+            target=queue_and_drain_second_report,
+            daemon=True,
+        )
+        first_drainer.start()
+        try:
+            self.assertTrue(first_callback_started.wait(TEST_TIMEOUT))
+            second_drainer.start()
+            self.assertTrue(second_report_queued.wait(TEST_TIMEOUT))
+            self.assertTrue(
+                dispatch_lock.contender_waiting.wait(TEST_TIMEOUT)
+            )
+            self.assertFalse(second_callback_started.is_set())
+        finally:
+            allow_first_callback.set()
+            first_drainer.join(TEST_TIMEOUT)
+            if second_drainer.ident is not None:
+                second_drainer.join(TEST_TIMEOUT)
+
+        self.assertFalse(first_drainer.is_alive())
+        self.assertFalse(second_drainer.is_alive())
+        self.assertEqual(received_reports, [{"1": 1}, {"1": 2}])
 
     def test_control_and_query_use_unique_sequence_numbers(self) -> None:
         """A query ignores a same-millisecond control response."""

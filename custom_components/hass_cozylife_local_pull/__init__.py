@@ -180,6 +180,9 @@ def setup(hass: HomeAssistant, config: ConfigType) -> bool:
             hass.async_create_task(
                 async_load_platform(hass, 'switch', DOMAIN, {}, config)
             )
+            hass.async_create_task(
+                async_load_platform(hass, 'number', DOMAIN, {}, config)
+            )
             _schedule_periodic_discovery(hass, lang, configured_ips)
 
     hass.loop.call_soon_threadsafe(finish_setup)
