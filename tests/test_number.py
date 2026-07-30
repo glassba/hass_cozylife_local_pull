@@ -19,6 +19,7 @@ from homeassistant.const import UnitOfTime
 from homeassistant.core import HomeAssistant, is_callback
 from homeassistant.exceptions import HomeAssistantError
 
+from custom_components.hass_cozylife_local_pull.const import DOMAIN
 from custom_components.hass_cozylife_local_pull.tcp_client import (
     DeviceCommandRejectedError,
 )
@@ -30,6 +31,12 @@ class FakeTcpClient:
     device_id = "device-1234"
     device_model_name = "Test Light"
     device_type_code = "01"
+    device_info = {
+        "identifiers": {(DOMAIN, device_id)},
+        "manufacturer": "CozyLife",
+        "model": device_model_name,
+        "name": "Test Light 1234",
+    }
 
     def __init__(
         self,

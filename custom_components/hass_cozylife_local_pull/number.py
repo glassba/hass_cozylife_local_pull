@@ -12,14 +12,14 @@ from homeassistant.components.number import (
     NumberEntity,
     NumberMode,
 )
+from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import UnitOfTime
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.exceptions import HomeAssistantError
-from homeassistant.helpers.entity_platform import AddEntitiesCallback
+from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 from homeassistant.helpers.event import async_track_time_interval
-from homeassistant.helpers.typing import ConfigType, DiscoveryInfoType
 
-from . import register_client_callback
+from . import register_device_callback
 from .const import (
     LIGHT_COUNTDOWN,
     LIGHT_TYPE_CODE,
@@ -28,7 +28,8 @@ from .const import (
     SWITCH_COUNTDOWN,
     SWITCH_TYPE_CODE,
 )
-from .tcp_client import DeviceCommandRejectedError, tcp_client
+from .device import CozyLifeDevice
+from .tcp_client import DeviceCommandRejectedError
 
 
 COUNTDOWN_TICK_INTERVAL = timedelta(seconds=1)
@@ -39,40 +40,31 @@ _COUNTDOWN_DEVICE_CONFIG = {
 }
 
 
-def setup_platform(
+async def async_setup_entry(
     hass: HomeAssistant,
-    config: ConfigType,
-    add_entities: AddEntitiesCallback,
-    discovery_info: DiscoveryInfoType | None = None,
+    entry: ConfigEntry,
+    async_add_entities: AddConfigEntryEntitiesCallback,
 ) -> None:
-    """Add countdown controls after a capable device finishes its handshake."""
-    if discovery_info is None:
-        return
-
+    """Add countdown controls for registered devices with matching capabilities."""
     from .motor import CozyLifeMotorCountdown
 
-    def add_ready_countdown(client: tcp_client) -> None:
-        """Create a countdown when the device advertises its data point."""
-        if client.device_type_code == MOTOR_TYPE_CODE:
-            if int(MOTOR_COUNTDOWN) in client.dpid:
-                add_entities([CozyLifeMotorCountdown(client)])
-            return
+    def add_device(device: CozyLifeDevice) -> None:
+        entity = None
+        if device.device_type_code == MOTOR_TYPE_CODE:
+            if int(MOTOR_COUNTDOWN) in device.dpid:
+                entity = CozyLifeMotorCountdown(device)
+        elif (
+            countdown_config := _COUNTDOWN_DEVICE_CONFIG.get(
+                device.device_type_code
+            )
+        ) is not None:
+            dp_id, label_suffix = countdown_config
+            if int(dp_id) in device.dpid:
+                entity = CozyLifeCountdown(device, dp_id, label_suffix)
+        if entity is not None:
+            hass.loop.call_soon_threadsafe(async_add_entities, [entity])
 
-        countdown_config = _COUNTDOWN_DEVICE_CONFIG.get(
-            client.device_type_code
-        )
-        if countdown_config is None:
-            return
-        dp_id, label_suffix = countdown_config
-        if int(dp_id) not in client.dpid:
-            return
-        add_entities([CozyLifeCountdown(client, dp_id, label_suffix)])
-
-    def register_client(client: tcp_client) -> None:
-        """Attach the countdown capability check to one network client."""
-        client.add_ready_callback(add_ready_countdown)
-
-    register_client_callback(hass, register_client)
+    register_device_callback(entry.runtime_data, add_device)
 
 
 class CozyLifeCountdown(NumberEntity):
@@ -90,12 +82,13 @@ class CozyLifeCountdown(NumberEntity):
 
     def __init__(
         self,
-        client: tcp_client,
+        device: CozyLifeDevice,
         dp_id: str,
         label_suffix: str,
     ) -> None:
         """Initialize one countdown variant without device input or output."""
-        self._tcp_client = client
+        self._device = device
+        self._attr_device_info = device.device_info
         self._dp_id = dp_id
         self._countdown_deadline: float | None = None
         self._state_updates_active = False
@@ -104,17 +97,17 @@ class CozyLifeCountdown(NumberEntity):
         self._cancel_countdown_calibration: Callable[[], None] | None = None
         self._remove_state_callback: Callable[[], None] | None = None
         self._attr_name = (
-            f"{client.device_model_name} {client.device_id[-4:]} "
+            f"{device.device_model_name} {device.device_id[-4:]} "
             f"{label_suffix}"
         )
         unique_id_suffix = label_suffix.lower().replace(" ", "_")
-        self._attr_unique_id = f"{client.device_id}_{unique_id_suffix}"
+        self._attr_unique_id = f"{device.device_id}_{unique_id_suffix}"
         self._attr_available = False
         self._attr_native_value = 0
 
     def _query_countdown_state(self) -> dict:
         """Query the countdown data point without changing entity state."""
-        return self._tcp_client.query([int(self._dp_id)])
+        return self._device.query([int(self._dp_id)])
 
     def _apply_countdown_query(self, state: dict) -> None:
         """Apply one device query result on the owning execution context."""
@@ -143,7 +136,7 @@ class CozyLifeCountdown(NumberEntity):
         """Apply an empty query only when no newer state arrived meanwhile."""
         if (
             self._dp_id in state
-            or self._tcp_client.last_state_sequence_number
+            or self._device.last_state_sequence_number
             != sequence_number_before_query
         ):
             return False
@@ -237,7 +230,7 @@ class CozyLifeCountdown(NumberEntity):
         """Apply one non-stale countdown state message."""
         if not self._state_updates_active:
             return
-        latest_sequence_number = self._tcp_client.last_state_sequence_number
+        latest_sequence_number = self._device.last_state_sequence_number
         if (
             latest_sequence_number is not None
             and sequence_number < latest_sequence_number
@@ -262,7 +255,7 @@ class CozyLifeCountdown(NumberEntity):
         if not self._state_updates_active:
             return
         sequence_number_before_query = (
-            self._tcp_client.last_state_sequence_number
+            self._device.last_state_sequence_number
         )
         state = await self.hass.async_add_executor_job(
             self._query_countdown_state
@@ -298,11 +291,11 @@ class CozyLifeCountdown(NumberEntity):
         """Start local updates after Home Assistant owns the entity."""
         await super().async_added_to_hass()
         self._state_updates_active = True
-        self._remove_state_callback = self._tcp_client.add_state_callback(
+        self._remove_state_callback = self._device.add_state_callback(
             self._handle_state_report
         )
         sequence_number_before_query = (
-            self._tcp_client.last_state_sequence_number
+            self._device.last_state_sequence_number
         )
         state = await self.hass.async_add_executor_job(
             self._query_countdown_state
@@ -327,7 +320,7 @@ class CozyLifeCountdown(NumberEntity):
         if not self._state_updates_active:
             return
         sequence_number_before_query = (
-            self._tcp_client.last_state_sequence_number
+            self._device.last_state_sequence_number
         )
         state = await self.hass.async_add_executor_job(
             self._query_countdown_state
@@ -348,7 +341,7 @@ class CozyLifeCountdown(NumberEntity):
 
         try:
             control_succeeded = await self.hass.async_add_executor_job(
-                self._tcp_client.control,
+                self._device.control,
                 {self._dp_id: countdown_seconds},
             )
         except DeviceCommandRejectedError as err:

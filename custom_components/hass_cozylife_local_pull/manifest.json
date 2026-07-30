@@ -4,6 +4,7 @@
   "integration_type": "hub",
   "documentation": "https://github.com/cozylife/hass_cozylife_local_pull",
   "dependencies": [],
+  "config_flow": true,
   "codeowners": [],
   "requirements": [],
   "iot_class": "local_polling",

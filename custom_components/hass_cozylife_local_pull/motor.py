@@ -3,9 +3,9 @@
 from __future__ import annotations
 
 from .const import MOTOR_COUNTDOWN
+from .device import CozyLifeDevice
 from .number import CozyLifeCountdown
 from .switch import CozyLifeSwitch
-from .tcp_client import tcp_client
 
 
 class CozyLifeMotorSwitch(CozyLifeSwitch):
@@ -17,6 +17,6 @@ class CozyLifeMotorSwitch(CozyLifeSwitch):
 class CozyLifeMotorCountdown(CozyLifeCountdown):
     """Represent a motor's DPID 6 local countdown."""
 
-    def __init__(self, client: tcp_client) -> None:
+    def __init__(self, device: CozyLifeDevice) -> None:
         """Bind the shared countdown behavior to the motor data point."""
-        super().__init__(client, MOTOR_COUNTDOWN, "Countdown")
+        super().__init__(device, MOTOR_COUNTDOWN, "Countdown")

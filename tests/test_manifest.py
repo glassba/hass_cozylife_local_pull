@@ -29,3 +29,7 @@ class IntegrationManifestTest(unittest.TestCase):
     def test_manifest_version_marks_compatibility_release(self) -> None:
         """The Home Assistant compatibility fix has a patch release version."""
         self.assertEqual(self.manifest["version"], "0.2.1")
+
+    def test_yaml_import_enables_config_flow(self) -> None:
+        """YAML devices load through a Home Assistant config entry."""
+        self.assertTrue(self.manifest["config_flow"])

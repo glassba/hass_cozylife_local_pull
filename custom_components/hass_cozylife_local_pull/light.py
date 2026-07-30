@@ -18,14 +18,13 @@ from homeassistant.components.light import (
     ColorMode,
     LightEntity,
 )
+from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import HomeAssistantError
-from homeassistant.helpers.entity_platform import AddEntitiesCallback
-from homeassistant.helpers.typing import ConfigType, DiscoveryInfoType
+from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 from homeassistant.util import color as color_util
 from typing import Any, Final, Literal, TypedDict, final
 from .const import (
-    DOMAIN,
     SWITCH_TYPE_CODE,
     LIGHT_TYPE_CODE,
     LIGHT_DPID,
@@ -36,42 +35,27 @@ from .const import (
     HUE,
     SAT,
 )
-from .tcp_client import DeviceCommandRejectedError, tcp_client
-from . import register_client_callback
+from .device import CozyLifeDevice
+from .tcp_client import DeviceCommandRejectedError
+from . import register_device_callback
 import logging
-from homeassistant.components import zeroconf
 
 _LOGGER = logging.getLogger(__name__)
 _LOGGER.info(__name__)
 
-def setup_platform(
+
+async def async_setup_entry(
     hass: HomeAssistant,
-    config: ConfigType,
-    add_entities: AddEntitiesCallback,
-    discovery_info: DiscoveryInfoType | None = None
+    entry: ConfigEntry,
+    async_add_entities: AddConfigEntryEntitiesCallback,
 ) -> None:
-    """Set up the sensor platform."""
-    # We only want this platform to be set up via discovery.
-    _LOGGER.info(
-        f'setup_platform.hass={hass},config={config},add_entities={add_entities},discovery_info={discovery_info}')
-    # zc = await zeroconf.async_get_instance(hass)
-    # _LOGGER.info(f'zc={zc}')
-    _LOGGER.info(f'hass.data={hass.data[DOMAIN]}')
-    _LOGGER.info(f'discovery_info={discovery_info}')
+    """Add lights for existing and subsequently registered devices."""
+    def add_device(device: CozyLifeDevice) -> None:
+        if LIGHT_TYPE_CODE == device.device_type_code:
+            entity = CozyLifeLight(device)
+            hass.loop.call_soon_threadsafe(async_add_entities, [entity])
 
-    if discovery_info is None:
-        return
-    
-    def add_ready_light(item: tcp_client) -> None:
-        """Add a light when its device information becomes available."""
-        if LIGHT_TYPE_CODE == item.device_type_code:
-            add_entities([CozyLifeLight(item)])
-
-    def register_client(item: tcp_client) -> None:
-        """Attach the light readiness callback to one network client."""
-        item.add_ready_callback(add_ready_light)
-
-    register_client_callback(hass, register_client)
+    register_device_callback(entry.runtime_data, add_device)
 
 
 class CozyLifeLight(LightEntity):
@@ -79,7 +63,7 @@ class CozyLifeLight(LightEntity):
     # _attr_color_mode: str | None = None
     # _attr_color_temp_kelvin: int | None = None
     # _attr_hs_color = None
-    _tcp_client = None
+    _device: CozyLifeDevice
     
     _attr_supported_color_modes: set[ColorMode]
     _attr_color_mode: ColorMode | None
@@ -91,43 +75,44 @@ class CozyLifeLight(LightEntity):
     # _attr_color_temp_kelvin = int
     # _attr_hs_color = (float, float)
     
-    def __init__(self, tcp_client: tcp_client) -> None:
+    def __init__(self, device: CozyLifeDevice) -> None:
         """Initialize color capabilities independently for this light."""
         _LOGGER.info('__init__')
-        self._tcp_client = tcp_client
+        self._device = device
+        self._attr_device_info = device.device_info
         self._state: dict[str, int] = {}
+        self._attr_available = False
         self._state_updates_active = False
         self._initial_query_complete = False
         self._remove_state_callback: Callable[[], None] | None = None
-        self._unique_id = tcp_client.device_id
-        self._name = tcp_client.device_model_name + ' ' + tcp_client.device_id[-4:]
+        self._unique_id = device.device_id
+        self._name = device.device_model_name + ' ' + device.device_id[-4:]
         self._attr_supported_color_modes = set()
         
         _LOGGER.info(f'before:{self._unique_id}._attr_color_mode={self._attr_color_mode}._attr_supported_color_modes='
-                     f'{self._attr_supported_color_modes}.dpid={tcp_client.dpid}')
+                     f'{self._attr_supported_color_modes}.dpid={device.dpid}')
         # h s
-        if 3 in tcp_client.dpid:
+        if 3 in device.dpid:
             self._attr_color_mode = ColorMode.COLOR_TEMP
             self._attr_supported_color_modes.add(ColorMode.COLOR_TEMP)
         
-        if 5 in tcp_client.dpid and 6 in tcp_client.dpid:
+        if 5 in device.dpid and 6 in device.dpid:
             self._attr_color_mode = ColorMode.HS
             self._attr_supported_color_modes.add(ColorMode.HS)
 
         if not self._attr_supported_color_modes:
             self._attr_color_mode = (
-                ColorMode.BRIGHTNESS if 4 in tcp_client.dpid else ColorMode.ONOFF
+                ColorMode.BRIGHTNESS if 4 in device.dpid else ColorMode.ONOFF
             )
             self._attr_supported_color_modes.add(self._attr_color_mode)
         
         _LOGGER.info(f'after:{self._unique_id}._attr_color_mode={self._attr_color_mode}._attr_supported_color_modes='
-                     f'{self._attr_supported_color_modes}.dpid={tcp_client.dpid}')
+                     f'{self._attr_supported_color_modes}.dpid={device.dpid}')
         
-        self._refresh_state()
-    
+
     def _refresh_state(self) -> None:
         """Refresh state, marking the light unavailable without switch data."""
-        state = self._tcp_client.query()
+        state = self._device.query()
         _LOGGER.info(f'_state={state}')
         self._apply_polled_state(state)
 
@@ -145,16 +130,16 @@ class CozyLifeLight(LightEntity):
     async def async_update(self) -> None:
         """Query in a worker and apply the result on the event loop."""
         sequence_number_before_query = (
-            self._tcp_client.last_state_sequence_number
+            self._device.last_state_sequence_number
         )
         state = await self.hass.async_add_executor_job(
-            self._tcp_client.query
+            self._device.query
         )
         if not self._state_updates_active:
             return
         if (
             SWITCH not in state
-            and self._tcp_client.last_state_sequence_number
+            and self._device.last_state_sequence_number
             == sequence_number_before_query
         ):
             self._state.pop(SWITCH, None)
@@ -179,7 +164,8 @@ class CozyLifeLight(LightEntity):
             self._attr_brightness = int(self._state[BRIGHT] / 4)
 
         has_hs_color = (
-            HUE in self._state
+            ColorMode.HS in self._attr_supported_color_modes
+            and HUE in self._state
             and SAT in self._state
             and self._state[HUE] != 65535
             and self._state[SAT] != 65535
@@ -192,24 +178,34 @@ class CozyLifeLight(LightEntity):
             )
 
         has_color_temperature = (
-            TEMP in self._state and self._state[TEMP] != 65535
+            ColorMode.COLOR_TEMP in self._attr_supported_color_modes
+            and TEMP in self._state
+            and self._state[TEMP] != 65535
         )
         self._attr_color_temp_kelvin = None
-        if TEMP in self._state:
+        if has_color_temperature:
             color_temp_mired = 500 - int(self._state[TEMP] / 2)
-            if has_color_temperature and color_temp_mired > 0:
+            if color_temp_mired > 0:
                 self._attr_color_temp_kelvin = (
                     color_util.color_temperature_mired_to_kelvin(color_temp_mired)
                 )
 
+        color_modes = self._attr_supported_color_modes & {
+            ColorMode.COLOR_TEMP,
+            ColorMode.HS,
+        }
+        # Home Assistant requires an on light to report one declared color mode.
         if has_hs_color:
             self._attr_color_mode = ColorMode.HS
         elif self._attr_color_temp_kelvin is not None:
             self._attr_color_mode = ColorMode.COLOR_TEMP
-        elif self._attr_supported_color_modes & {
-            ColorMode.COLOR_TEMP,
-            ColorMode.HS,
-        }:
+        elif self._attr_is_on and self._attr_color_mode is None and color_modes:
+            self._attr_color_mode = (
+                ColorMode.HS
+                if ColorMode.HS in color_modes
+                else ColorMode.COLOR_TEMP
+            )
+        elif not self._attr_is_on and color_modes:
             self._attr_color_mode = None
 
     def _handle_state_report(
@@ -234,7 +230,7 @@ class CozyLifeLight(LightEntity):
         """Merge one state message and publish all light fields together."""
         if not self._state_updates_active:
             return
-        latest_sequence_number = self._tcp_client.last_state_sequence_number
+        latest_sequence_number = self._device.last_state_sequence_number
         if (
             latest_sequence_number is not None
             and sequence_number < latest_sequence_number
@@ -249,7 +245,7 @@ class CozyLifeLight(LightEntity):
         """Subscribe after Home Assistant can safely receive state writes."""
         await super().async_added_to_hass()
         self._state_updates_active = True
-        self._remove_state_callback = self._tcp_client.add_state_callback(
+        self._remove_state_callback = self._device.add_state_callback(
             self._handle_state_report
         )
         await self.async_update()
@@ -296,7 +292,7 @@ class CozyLifeLight(LightEntity):
         """Run device input/output in a worker and own state on the event loop."""
         try:
             control_succeeded = await self.hass.async_add_executor_job(
-                self._tcp_client.control,
+                self._device.control,
                 payload,
             )
         except DeviceCommandRejectedError as err:
@@ -331,7 +327,7 @@ class CozyLifeLight(LightEntity):
             for value in (brightness, color_temp_kelvin, hs_color)
         )
         # Preserve the current effect on plain turn-on and unsupported models.
-        if 2 in self._tcp_client.dpid and static_control_requested:
+        if 2 in self._device.dpid and static_control_requested:
             payload['2'] = 0
         if brightness is not None:
             payload['4'] = brightness * 4

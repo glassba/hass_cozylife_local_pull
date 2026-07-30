@@ -8,6 +8,7 @@ import threading
 import unittest
 from unittest.mock import patch
 
+from custom_components.hass_cozylife_local_pull.const import DOMAIN
 from homeassistant.exceptions import HomeAssistantError
 
 
@@ -16,6 +17,12 @@ class FakeTcpClient:
 
     device_id = "device-1234"
     device_model_name = "Test Light"
+    device_info = {
+        "identifiers": {(DOMAIN, device_id)},
+        "manufacturer": "CozyLife",
+        "model": device_model_name,
+        "name": "Test Light 1234",
+    }
 
     def __init__(
         self,
@@ -203,6 +210,107 @@ class LightColorModeTest(unittest.IsolatedAsyncioTestCase):
             len(entities),
         )
 
+    def test_undeclared_hs_fields_keep_supported_color_mode(self) -> None:
+        """Extra HS fields cannot override product color capabilities."""
+        light = importlib.import_module(
+            "custom_components.hass_cozylife_local_pull.light"
+        )
+        entity = light.CozyLifeLight(
+            FakeTcpClient(
+                [1, 2, 3, 4],
+                {
+                    "1": 1,
+                    "2": 0,
+                    "3": 65535,
+                    "4": 720,
+                    "5": 120,
+                    "6": 500,
+                },
+            )
+        )
+
+        entity.update()
+        try:
+            state_attributes = entity.state_attributes
+        except HomeAssistantError as err:
+            self.fail(f"Unsupported HS fields broke state writing: {err}")
+
+        self.assertEqual(
+            entity.supported_color_modes,
+            {light.ColorMode.COLOR_TEMP},
+        )
+        self.assertEqual(entity.color_mode, light.ColorMode.COLOR_TEMP)
+        self.assertIsNone(entity.hs_color)
+        self.assertIsNone(entity.color_temp_kelvin)
+        self.assertEqual(
+            state_attributes["color_mode"],
+            light.ColorMode.COLOR_TEMP,
+        )
+
+    def test_undeclared_temperature_field_keeps_supported_hs_mode(self) -> None:
+        """An extra temperature field cannot override HS-only capabilities."""
+        light = importlib.import_module(
+            "custom_components.hass_cozylife_local_pull.light"
+        )
+        entity = light.CozyLifeLight(
+            FakeTcpClient(
+                [1, 4, 5, 6],
+                {
+                    "1": 255,
+                    "3": 300,
+                    "4": 720,
+                    "5": 65535,
+                    "6": 65535,
+                },
+            )
+        )
+
+        entity.update()
+        try:
+            state_attributes = entity.state_attributes
+        except HomeAssistantError as err:
+            self.fail(f"Unsupported temperature field broke state writing: {err}")
+
+        self.assertEqual(
+            entity.supported_color_modes,
+            {light.ColorMode.HS},
+        )
+        self.assertEqual(entity.color_mode, light.ColorMode.HS)
+        self.assertIsNone(entity.color_temp_kelvin)
+        self.assertEqual(
+            state_attributes["color_mode"],
+            light.ColorMode.HS,
+        )
+
+    async def test_switch_only_report_restores_color_mode_after_off(self) -> None:
+        """A switch-only on report restores a supported color mode."""
+        light = importlib.import_module(
+            "custom_components.hass_cozylife_local_pull.light"
+        )
+        client = FakeTcpClient(
+            [1, 3, 4],
+            {"1": 0, "3": 65535, "4": 720},
+        )
+        entity = light.CozyLifeLight(client)
+        entity.hass = FakeHomeAssistant(asyncio.get_running_loop())
+        await entity.async_added_to_hass()
+
+        self.assertIsNone(entity.color_mode)
+        with patch.object(entity, "async_write_ha_state") as write_state:
+            client.report({"1": 255})
+            await asyncio.sleep(0)
+            try:
+                state_attributes = entity.state_attributes
+            except HomeAssistantError as err:
+                self.fail(f"Switch-only on report broke state writing: {err}")
+
+        self.assertEqual(entity.color_mode, light.ColorMode.COLOR_TEMP)
+        self.assertEqual(
+            state_attributes["color_mode"],
+            light.ColorMode.COLOR_TEMP,
+        )
+        write_state.assert_called_once_with()
+
     async def test_color_commands_keep_hs_priority_for_device_reply(self) -> None:
         """A dual-mode light derives its mode from the reported device fields."""
         light = importlib.import_module(
@@ -363,7 +471,7 @@ class LightActiveReportTest(unittest.IsolatedAsyncioTestCase):
         with patch.object(entity, "async_write_ha_state") as write_state:
             await entity.async_added_to_hass()
 
-        self.assertEqual(client.query_count, 2)
+        self.assertEqual(client.query_count, 1)
         self.assertTrue(entity.is_on)
         self.assertEqual(entity.brightness, 100)
         write_state.assert_not_called()
@@ -748,6 +856,7 @@ class LightColorTemperatureTest(unittest.IsolatedAsyncioTestCase):
         entity = light.CozyLifeLight(
             FakeTcpClient([1, 3, 4], {"1": 255, "3": 300, "4": 400})
         )
+        entity.update()
 
         self.assertEqual(entity.color_temp_kelvin, 2857)
 
@@ -797,6 +906,7 @@ class LightColorTemperatureTest(unittest.IsolatedAsyncioTestCase):
             entity = light.CozyLifeLight(
                 FakeTcpClient([1, 3, 4], {"1": 0, "3": 1000, "4": 0})
             )
+            entity.update()
         except ZeroDivisionError as err:
             self.fail(f"Invalid device temperature caused division by zero: {err}")
 

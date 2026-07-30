@@ -1,0 +1,8 @@
+{
+  "title": "CozyLife local",
+  "config": {
+    "abort": {
+      "yaml_only": "This integration is configured in configuration.yaml."
+    }
+  }
+}

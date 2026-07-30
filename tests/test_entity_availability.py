@@ -7,6 +7,7 @@ import threading
 import unittest
 from unittest.mock import patch
 
+from custom_components.hass_cozylife_local_pull.const import DOMAIN
 from custom_components.hass_cozylife_local_pull.light import CozyLifeLight
 from custom_components.hass_cozylife_local_pull.motor import (
     CozyLifeMotorSwitch,
@@ -23,6 +24,12 @@ class SequencedDeviceClient:
 
     device_id = "device-1234"
     device_model_name = "Test Device"
+    device_info = {
+        "identifiers": {(DOMAIN, device_id)},
+        "manufacturer": "CozyLife",
+        "model": device_model_name,
+        "name": "Test Device 1234",
+    }
     dpid = [1, 4]
 
     def __init__(
@@ -95,6 +102,26 @@ class TimestampedReplyClient(SequencedDeviceClient):
         return True
 
 
+class NewerReportDuringQueryClient(SequencedDeviceClient):
+    """Publish a newer report before returning an older query snapshot."""
+
+    def __init__(
+        self,
+        older_state: dict[str, int],
+        newer_state: dict[str, int],
+    ) -> None:
+        super().__init__([older_state])
+        self._older_state = older_state
+        self._newer_state = newer_state
+
+    def query(self) -> dict[str, int]:
+        """Return the older snapshot after both timestamped replies are queued."""
+        self.query_count += 1
+        self.report(self._older_state, 1700000000000)
+        self.report(self._newer_state, 1700000000001)
+        return self._older_state
+
+
 class ImmediateLoop:
     """Run thread-safe callbacks immediately in entity unit tests."""
 
@@ -145,6 +172,7 @@ class EntityAvailabilityTest(unittest.IsolatedAsyncioTestCase):
             entity = CozyLifeLight(client)
         except KeyError as err:
             self.fail(f"Empty light state raised an exception: {err}")
+        entity.update()
         self.assertFalse(entity.available)
 
         self.assertTrue(entity.should_poll, "Light must enable polling")
@@ -174,6 +202,7 @@ class EntityAvailabilityTest(unittest.IsolatedAsyncioTestCase):
             entity = CozyLifeSwitch(client)
         except KeyError as err:
             self.fail(f"Empty switch state raised an exception: {err}")
+        entity.update()
         self.assertFalse(entity.available)
 
         self.assertTrue(entity.should_poll, "Switch must enable polling")
@@ -190,7 +219,9 @@ class EntityAvailabilityTest(unittest.IsolatedAsyncioTestCase):
         """Reading cached light state does not perform network input or output."""
         state = {"1": 255, "4": 400, "5": 120, "6": 500}
         client = SequencedDeviceClient([state.copy()] * 4)
+        client.dpid = [1, 4, 5, 6]
         entity = CozyLifeLight(client)
+        entity.update()
 
         self.assertTrue(entity.is_on)
         self.assertEqual(entity.brightness, 100)
@@ -202,6 +233,7 @@ class EntityAvailabilityTest(unittest.IsolatedAsyncioTestCase):
         client = SequencedDeviceClient([{"1": 0}, {}])
         entity = CozyLifeSwitch(client)
 
+        entity.update()
         entity.update()
         self.assertFalse(entity.is_on)
         self.assertFalse(entity.available)
@@ -259,6 +291,7 @@ class EntityAvailabilityTest(unittest.IsolatedAsyncioTestCase):
             with self.subTest(entity_type=entity_type, command=command_name):
                 client = SequencedDeviceClient([state.copy()])
                 entity = entity_type(client)
+                entity.update()
                 entity.hass = FakeHomeAssistant(asyncio.get_running_loop())
                 previous_is_on = entity.is_on
                 error = None
@@ -307,6 +340,8 @@ class EntityAvailabilityTest(unittest.IsolatedAsyncioTestCase):
         entity = CozyLifeSwitch(client)
         entity.hass = FakeHomeAssistant(loop)
         await entity.async_added_to_hass()
+        with patch.object(entity, "async_write_ha_state"):
+            loop.drain()
 
         client.publish({"1": 255}, 1700000000000)
         client.last_state_sequence_number = 1700000000001
@@ -315,6 +350,45 @@ class EntityAvailabilityTest(unittest.IsolatedAsyncioTestCase):
 
         self.assertFalse(entity.is_on)
         write_state.assert_not_called()
+
+    async def test_newer_report_wins_over_completed_query(self) -> None:
+        """An older query snapshot cannot replace a newer device report."""
+        cases = (
+            (
+                CozyLifeSwitch,
+                {"1": 0},
+                {"1": 255},
+                None,
+            ),
+            (
+                CozyLifeLight,
+                {"1": 0, "4": 0},
+                {"1": 255, "4": 400},
+                100,
+            ),
+        )
+
+        for entity_type, older_state, newer_state, expected_brightness in cases:
+            with self.subTest(entity_type=entity_type):
+                client = NewerReportDuringQueryClient(
+                    older_state, newer_state
+                )
+                entity = entity_type(client)
+                entity.hass = FakeHomeAssistant(asyncio.get_running_loop())
+
+                try:
+                    await entity.async_added_to_hass()
+
+                    self.assertEqual(
+                        client.last_state_sequence_number,
+                        1700000000001,
+                    )
+                    self.assertTrue(entity.is_on)
+                    self.assertTrue(entity.available)
+                    if expected_brightness is not None:
+                        self.assertEqual(entity.brightness, expected_brightness)
+                finally:
+                    await entity.async_will_remove_from_hass()
 
     async def test_unexpected_control_exception_allows_later_reports(
         self,
@@ -411,7 +485,7 @@ class EntityAvailabilityTest(unittest.IsolatedAsyncioTestCase):
                 await getattr(entity, command_name)()
 
                 self.assertTrue(entity.available)
-                self.assertEqual(client.query_count, 2)
+                self.assertEqual(client.query_count, 1)
 
 
 class SwitchActiveReportTest(unittest.IsolatedAsyncioTestCase):
@@ -466,7 +540,7 @@ class SwitchActiveReportTest(unittest.IsolatedAsyncioTestCase):
         self,
     ) -> None:
         """A query after subscribing restores a switch setup-time report."""
-        client = SequencedDeviceClient([{"1": 0}, {"1": 255}])
+        client = SequencedDeviceClient([{"1": 255}])
         entity = CozyLifeSwitch(client)
         client.report({"1": 255}, 1700000000000)
         entity.hass = FakeHomeAssistant(asyncio.get_running_loop())
@@ -474,7 +548,7 @@ class SwitchActiveReportTest(unittest.IsolatedAsyncioTestCase):
         with patch.object(entity, "async_write_ha_state") as write_state:
             await entity.async_added_to_hass()
 
-        self.assertEqual(client.query_count, 2)
+        self.assertEqual(client.query_count, 1)
         self.assertTrue(entity.is_on)
         self.assertTrue(entity.available)
         write_state.assert_not_called()

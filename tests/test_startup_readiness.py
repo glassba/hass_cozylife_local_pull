@@ -1,23 +1,15 @@
-"""Regression tests for adding devices after their startup handshake completes."""
+"""Verify discovery registers ready devices before creating entities."""
 
 from __future__ import annotations
 
 import asyncio
-from concurrent.futures import ThreadPoolExecutor
-from datetime import UTC, datetime, timedelta
-import importlib
-import inspect
-import queue
+from types import SimpleNamespace
 import threading
 import unittest
-from unittest.mock import Mock, patch
+from unittest.mock import patch
 
-from custom_components.hass_cozylife_local_pull import (
-    light,
-    motor,
-    number,
-    switch,
-)
+import custom_components.hass_cozylife_local_pull as integration
+from custom_components.hass_cozylife_local_pull import light, motor, number, switch
 from custom_components.hass_cozylife_local_pull.const import (
     DOMAIN,
     LIGHT_TYPE_CODE,
@@ -25,1319 +17,425 @@ from custom_components.hass_cozylife_local_pull.const import (
     SUPPORT_DEVICE_CATEGORY,
     SWITCH_TYPE_CODE,
 )
+from custom_components.hass_cozylife_local_pull.device import CozyLifeDevice
 
 
-class DelayedDeviceClient:
-    """Expose the production readiness callback contract without network I/O."""
+class DelayedTransport:
+    """Expose the complete transport contract without network input or output."""
 
-    device_id = "device-1234"
     device_model_name = "Test Device"
-    dpid = [1, 4, 6, 13]
-
-    def __init__(self, device_type_code: str | type = str) -> None:
-        self.device_type_code = device_type_code
-        self._ready_callbacks = []
-        self._ready_callback_lock = threading.RLock()
-        self.registration_count = 0
-        self.closed = False
-        self._stopped = False
-        self.stop_signaled = threading.Event()
-
-    def add_ready_callback(self, callback) -> None:
-        """Run immediately when ready or retain the one-shot callback."""
-        with self._ready_callback_lock:
-            if self._stopped:
-                return
-            self.registration_count += 1
-            if self.device_type_code is not str:
-                callback(self)
-                return
-            self._ready_callbacks.append(callback)
-
-    def become_ready(self, device_type_code: str) -> None:
-        """Complete the delayed handshake and publish readiness."""
-        with self._ready_callback_lock:
-            if self._stopped:
-                return
-            self.device_type_code = device_type_code
-            callbacks, self._ready_callbacks = self._ready_callbacks, []
-            for callback in callbacks:
-                callback(self)
-
-    def query(self, attributes: list[int] | None = None) -> dict[str, int]:
-        """Return a complete state for either supported entity type."""
-        return {"1": 0, "4": 0, "13": 0}
-
-    def control(self, payload: dict[str, int]) -> bool:
-        """Accept entity commands used during setup tests."""
-        return True
-
-    def close(self) -> None:
-        """Record lifecycle cleanup."""
-        self.request_stop()
-        self.closed = True
-
-    def signal_stop(self) -> None:
-        """Reject new work without waiting for readiness callbacks."""
-        self._stopped = True
-        self.stop_signaled.set()
-
-    def request_stop(self) -> None:
-        """Reject new readiness callbacks before blocking cleanup begins."""
-        self.signal_stop()
-        with self._ready_callback_lock:
-            pass
-
-
-class ObservedRLock:
-    """Signal when another thread waits for the owned reentrant lock."""
-
-    def __init__(self, contender_waiting: threading.Event) -> None:
-        self._lock = threading.RLock()
-        self._contender_waiting = contender_waiting
-
-    def __enter__(self):
-        if not self._lock.acquire(blocking=False):
-            self._contender_waiting.set()
-            self._lock.acquire()
-        return self
-
-    def __exit__(self, exc_type, exc_value, traceback) -> None:
-        self._lock.release()
-
-
-class BlockingCloseDeviceClient(DelayedDeviceClient):
-    """Expose the window before blocking client cleanup marks itself stopped."""
+    dpid = [1, 2, 4, 6, 13]
+    last_state_sequence_number = 1700000000000
 
     def __init__(
         self,
-        close_started: threading.Event,
-        allow_close: threading.Event,
-        timeout: float,
+        ip: str = "192.0.2.10",
+        lang: str = "en",
+        device_type_code: str | None = None,
+        device_id: str | None = None,
     ) -> None:
-        super().__init__(LIGHT_TYPE_CODE)
-        self._close_started = close_started
-        self._allow_close = allow_close
-        self._timeout = timeout
-        self.release_timed_out = threading.Event()
+        self.ip = ip
+        self.lang = lang
+        self.device_id = device_id or f"device-{ip}"
+        self.device_type_code = device_type_code
+        self.ready_callbacks = []
+        self.state_callbacks = []
+        self.registration_count = 0
+        self.query_count = 0
+        self.closed = False
+        self.stop_signaled = False
+
+    def add_ready_callback(self, callback) -> None:
+        """Run immediately when ready or retain the one-shot callback."""
+        if self.stop_signaled:
+            return
+        self.registration_count += 1
+        if self.device_type_code is None:
+            self.ready_callbacks.append(callback)
+        else:
+            callback(self)
+
+    def become_ready(self, device_type_code: str) -> None:
+        """Complete the delayed handshake and notify subscribers once."""
+        if self.stop_signaled:
+            return
+        self.device_type_code = device_type_code
+        callbacks, self.ready_callbacks = self.ready_callbacks, []
+        for callback in callbacks:
+            callback(self)
+
+    def query(self, attributes: list[int] | None = None) -> dict[str, int]:
+        """Return all requested properties with an inactive value."""
+        self.query_count += 1
+        dpids = attributes or self.dpid
+        return {str(dp_id): 0 for dp_id in dpids}
+
+    def control(self, payload: dict[str, int]) -> bool:
+        """Accept entity control requests."""
+        return True
+
+    def add_state_callback(self, callback):
+        """Register a state subscriber and return its removal callback."""
+        self.state_callbacks.append(callback)
+
+        def remove_callback() -> None:
+            self.state_callbacks.remove(callback)
+
+        return remove_callback
+
+    def report(self, state: dict[str, int], sequence_number: int) -> None:
+        """Deliver one state report to current transport subscribers."""
+        for callback in tuple(self.state_callbacks):
+            callback(state, sequence_number)
+
+    def signal_stop(self) -> None:
+        """Reject new readiness callbacks."""
+        self.stop_signaled = True
 
     def close(self) -> None:
-        """Wait at the cleanup boundary before completing lifecycle shutdown."""
-        self._close_started.set()
-        if not self._allow_close.wait(self._timeout):
-            self.release_timed_out.set()
-            raise TimeoutError("Timed out waiting to release client close")
-        super().close()
+        """Record final transport cleanup."""
+        self.closed = True
 
 
-class RecordingLoop:
-    """Execute thread-safe scheduling calls while recording their payloads."""
-
-    def __init__(self) -> None:
-        self.scheduled = []
-
-    def call_soon_threadsafe(self, callback, *args) -> None:
-        """Record and execute a scheduled callback."""
-        self.scheduled.append(args)
-        callback(*args)
-
-
-class DeferredRecordingLoop:
-    """Retain thread-safe callbacks until the test advances the event loop."""
-
-    def __init__(self) -> None:
-        self.scheduled = []
-
-    def call_soon_threadsafe(self, callback, *args) -> None:
-        """Queue a callback without executing it."""
-        self.scheduled.append((callback, args))
-
-    def run_scheduled(self) -> None:
-        """Execute the callbacks that were queued before this boundary."""
-        scheduled, self.scheduled = self.scheduled, []
-        for callback, args in scheduled:
-            callback(*args)
+def make_runtime() -> dict:
+    """Build the production runtime shape used by discovery and platforms."""
+    return {
+        "ip": [],
+        "known_ips": set(),
+        "tcp_client": [],
+        "devices": {},
+        "device_callbacks": [],
+        "lock": threading.RLock(),
+        "discovery_lock": threading.RLock(),
+        "stopped": False,
+        "cancel_discovery": None,
+        "remove_stop_listener": None,
+    }
 
 
-class RecordingBus:
-    """Record one-shot lifecycle listeners registered by the integration."""
+class DeviceRegistrationTest(unittest.TestCase):
+    """Verify transports become devices only after a valid handshake."""
 
-    def __init__(self) -> None:
-        self.listeners = []
+    def test_client_waits_for_readiness_before_device_registration(self) -> None:
+        """An address alone cannot create a device or entity."""
+        runtime = make_runtime()
+        client = DelayedTransport()
+        notified_devices = []
+        integration.register_device_callback(runtime, notified_devices.append)
 
-    def listen_once(self, event_type, listener):
-        """Retain a listener so tests can publish the stop event."""
-        self.listeners.append((event_type, listener))
-        return lambda: None
+        with patch.object(integration, "tcp_client", return_value=client):
+            integration._add_new_clients(runtime, [client.ip], "zh")
 
+        self.assertEqual(runtime["devices"], {})
+        self.assertEqual(notified_devices, [])
+        client.become_ready(LIGHT_TYPE_CODE)
 
-class RecordingHomeAssistant:
-    """Provide the Home Assistant attributes used by synchronous setup."""
+        self.assertEqual(list(runtime["devices"]), [client.device_id])
+        self.assertEqual(notified_devices, [runtime["devices"][client.device_id]])
+        self.assertIsInstance(notified_devices[0], CozyLifeDevice)
 
-    def __init__(self, clients=None) -> None:
-        self.data = {}
-        if clients is not None:
-            self.data[DOMAIN] = {
-                "tcp_client": clients,
-                "ip": [],
-                "known_ips": set(),
-                "client_callbacks": [],
-                "lock": threading.RLock(),
-                "discovery_lock": threading.RLock(),
-                "stopped": False,
-            }
-        self.loop = RecordingLoop()
-        self.bus = RecordingBus()
-        self.created_tasks = []
-        self.executor_thread_ids = []
-        self.is_stopping = False
-
-    def async_create_task(self, task) -> None:
-        """Record scheduled platform loads without starting an event loop."""
-        self.created_tasks.append(task)
-
-    async def async_add_executor_job(self, target, *args):
-        """Execute discovery in a worker like Home Assistant does."""
-        def run_target():
-            self.executor_thread_ids.append(threading.get_ident())
-            return target(*args)
-
-        with ThreadPoolExecutor(max_workers=1) as executor:
-            return await asyncio.get_running_loop().run_in_executor(
-                executor, run_target
-            )
-
-
-class StartupReadinessTest(unittest.TestCase):
-    """Verify startup never depends on a fixed connection delay."""
-
-    def test_setup_loads_platforms_without_fixed_sleep(self) -> None:
-        """Integration setup schedules platforms immediately after clients."""
-        integration = importlib.import_module(
-            "custom_components.hass_cozylife_local_pull"
-        )
-
-        hass = RecordingHomeAssistant()
-        platform_loads = []
-
-        async def platform_load(platform: str) -> str:
-            """Represent one Home Assistant asynchronous platform load."""
-            return platform
-
-        def create_platform_load(hass, platform, *args):
-            load = platform_load(platform)
-            platform_loads.append(load)
-            self.addCleanup(load.close)
-            return load
-
-        load_platform = Mock(side_effect=create_platform_load)
-        with patch.object(integration, "get_ip", return_value=["192.0.2.1"]), patch.object(
-            integration, "tcp_client", return_value=DelayedDeviceClient()
-        ), patch.object(
-            integration, "async_load_platform", load_platform
-        ), patch.object(
-            integration,
-            "async_track_time_interval",
-            return_value=lambda: None,
-        ), patch.object(
-            integration, "time", create=True
-        ) as time_module:
-            setup_succeeded = integration.setup(hass, {DOMAIN: {}})
-
-        self.assertTrue(setup_succeeded)
-        time_module.sleep.assert_not_called()
-        self.assertEqual(
-            [call.args[1] for call in load_platform.call_args_list],
-            ["light", "switch", "number"],
-        )
-        self.assertTrue(all(inspect.isawaitable(load) for load in platform_loads))
-        self.assertEqual(hass.loop.scheduled, [()])
-        self.assertEqual(hass.created_tasks, platform_loads)
-
-    def test_deferred_setup_skips_platforms_and_interval_after_stop(self) -> None:
-        """Queued setup work rechecks both integration and Home Assistant stop."""
-        integration = importlib.import_module(
-            "custom_components.hass_cozylife_local_pull"
-        )
-
-        for stop_source in ("integration", "home_assistant"):
-            with self.subTest(stop_source=stop_source):
-                hass = RecordingHomeAssistant()
-                hass.loop = DeferredRecordingLoop()
-                load_platform = Mock(return_value=None)
-                track_interval = Mock(return_value=lambda: None)
-
-                with patch.object(
-                    integration, "get_ip", return_value=[]
-                ), patch.object(
-                    integration, "async_load_platform", load_platform
-                ), patch.object(
-                    integration,
-                    "async_track_time_interval",
-                    track_interval,
-                ):
-                    self.assertTrue(integration.setup(hass, {DOMAIN: {}}))
-                    if stop_source == "integration":
-                        _, stop_listener = hass.bus.listeners[0]
-                        stop_listener(None)
-                    else:
-                        hass.is_stopping = True
-                    hass.loop.run_scheduled()
-
-                load_platform.assert_not_called()
-                track_interval.assert_not_called()
-                self.assertEqual(hass.created_tasks, [])
-
-    def test_setup_handles_stop_during_initial_client_construction(self) -> None:
-        """Shutdown during initial discovery closes its late client."""
-        integration = importlib.import_module(
-            "custom_components.hass_cozylife_local_pull"
-        )
-        hass = RecordingHomeAssistant()
+    def test_one_batch_deduplicates_discovered_and_configured_address(self) -> None:
+        """The same address from both sources creates one transport and device."""
+        runtime = make_runtime()
         created_clients = []
-        load_platform = Mock(return_value=None)
-        track_interval = Mock(return_value=lambda: None)
 
-        def create_client(*args, **kwargs) -> DelayedDeviceClient:
-            client = DelayedDeviceClient()
+        def create_client(ip: str, lang: str) -> DelayedTransport:
+            client = DelayedTransport(ip, lang, SWITCH_TYPE_CODE)
             created_clients.append(client)
-            if hass.bus.listeners:
-                _, stop_listener = hass.bus.listeners[0]
-                stop_listener(None)
             return client
 
-        with patch.object(
-            integration, "get_ip", return_value=["192.0.2.10"]
-        ), patch.object(
-            integration, "tcp_client", side_effect=create_client
-        ), patch.object(
-            integration, "async_load_platform", load_platform
-        ), patch.object(
-            integration,
-            "async_track_time_interval",
-            track_interval,
-        ):
-            setup_succeeded = integration.setup(hass, {DOMAIN: {}})
-
-        self.assertTrue(setup_succeeded)
-        self.assertEqual(len(created_clients), 1)
-        self.assertTrue(created_clients[0].closed)
-        self.assertTrue(hass.data[DOMAIN]["stopped"])
-        self.assertEqual(hass.data[DOMAIN]["tcp_client"], [])
-        load_platform.assert_not_called()
-        track_interval.assert_not_called()
-
-    def test_late_client_close_failure_does_not_escape_discovery(self) -> None:
-        """A late client cleanup failure cannot escape discovery."""
-        integration = importlib.import_module(
-            "custom_components.hass_cozylife_local_pull"
-        )
-        hass = RecordingHomeAssistant([])
-
-        class FailingCloseClient(DelayedDeviceClient):
-            def close(self) -> None:
-                """Simulate a late client cleanup failure."""
-                raise RuntimeError("Injected late client close failure")
-
-        client = FailingCloseClient()
-
-        def create_client(*args, **kwargs) -> FailingCloseClient:
-            integration._close_clients(hass)
-            return client
-
-        try:
-            with self.assertLogs(integration.__name__, level="ERROR") as logs:
-                with patch.object(
-                    integration, "tcp_client", side_effect=create_client
-                ):
-                    integration._add_new_clients(hass, ["192.0.2.10"], "en")
-        except RuntimeError as err:
-            self.fail(f"Late client close failure escaped discovery: {err}")
-
-        self.assertTrue(hass.data[DOMAIN]["stopped"])
-        self.assertEqual(hass.data[DOMAIN]["tcp_client"], [])
-        self.assertEqual(hass.data[DOMAIN]["ip"], [])
-        self.assertTrue(any("192.0.2.10" in message for message in logs.output))
-
-    def test_periodic_discovery_adds_each_new_client_once(self) -> None:
-        """An initially empty integration discovers later devices without duplicates."""
-        integration = importlib.import_module(
-            "custom_components.hass_cozylife_local_pull"
-        )
-        hass = RecordingHomeAssistant()
-        event_loop_thread_id = threading.get_ident()
-        scheduled_intervals = []
-        platform_loads = []
-        created_clients = []
-
-        async def platform_load() -> None:
-            pass
-
-        def create_platform_load(*args):
-            load = platform_load()
-            platform_loads.append(load)
-            self.addCleanup(load.close)
-            return load
-
-        def create_client(ip: str, lang: str = "en") -> DelayedDeviceClient:
-            client = DelayedDeviceClient()
-            created_clients.append((ip, lang, client))
-            return client
-
-        def track_interval(hass, action, interval, **kwargs):
-            scheduled_intervals.append((action, interval, kwargs))
-            return lambda: None
-
-        with patch.object(
-            integration,
-            "get_ip",
-            side_effect=[[], ["192.0.2.10"], ["192.0.2.10"]],
-        ), patch.object(
-            integration, "tcp_client", side_effect=create_client
-        ), patch.object(
-            integration,
-            "async_load_platform",
-            new=Mock(side_effect=create_platform_load),
-        ), patch.object(
-            integration,
-            "async_track_time_interval",
-            side_effect=track_interval,
-            create=True,
-        ):
-            self.assertTrue(integration.setup(hass, {DOMAIN: {"lang": "zh"}}))
-            self.assertIn(DOMAIN, hass.data)
-            self.assertEqual(hass.data[DOMAIN]["tcp_client"], [])
-            self.assertEqual(len(scheduled_intervals), 1)
-            action, interval, options = scheduled_intervals[0]
-            self.assertEqual(interval, timedelta(seconds=60))
-            self.assertTrue(options["cancel_on_shutdown"])
-
-            subscriber = getattr(integration, "register_client_callback", None)
-            self.assertTrue(callable(subscriber))
-            notified_clients = []
-            subscriber(hass, notified_clients.append)
-
-            asyncio.run(action(datetime.now(UTC)))
-            asyncio.run(action(datetime.now(UTC)))
-
-        self.assertEqual(
-            [(ip, lang) for ip, lang, _ in created_clients],
-            [("192.0.2.10", "zh")],
-        )
-        self.assertEqual(notified_clients, [created_clients[0][2]])
-        self.assertEqual(hass.data[DOMAIN]["ip"], ["192.0.2.10"])
-        self.assertEqual(len(hass.executor_thread_ids), 2)
-        self.assertTrue(
-            all(
-                thread_id != event_loop_thread_id
-                for thread_id in hass.executor_thread_ids
-            )
-        )
-
-        self.assertEqual(len(hass.bus.listeners), 1)
-        _, stop_listener = hass.bus.listeners[0]
-        stop_listener(None)
-        self.assertTrue(created_clients[0][2].closed)
-
-    def test_concurrent_discovery_serializes_duplicate_address(self) -> None:
-        """Concurrent discovery tasks create one client for one address."""
-        integration = importlib.import_module(
-            "custom_components.hass_cozylife_local_pull"
-        )
-        hass = RecordingHomeAssistant([])
-        timeout = 5
-        first_discovery_started = threading.Event()
-        allow_first_discovery = threading.Event()
-        second_discovery_waiting = threading.Event()
-        get_ip_lock = threading.Lock()
-        get_ip_calls = 0
-        created_clients = []
-        notified_clients = []
-        thread_errors: queue.Queue[BaseException] = queue.Queue()
-        hass.data[DOMAIN]["discovery_lock"] = ObservedRLock(
-            second_discovery_waiting
-        )
-        integration.register_client_callback(hass, notified_clients.append)
-
-        def discover_address() -> list[str]:
-            nonlocal get_ip_calls
-            with get_ip_lock:
-                get_ip_calls += 1
-                call = get_ip_calls
-            if call == 1:
-                first_discovery_started.set()
-                if not allow_first_discovery.wait(timeout):
-                    raise TimeoutError(
-                        "Timed out waiting to release first discovery"
-                    )
-            return ["192.0.2.10"]
-
-        def create_client(ip: str, lang: str = "en") -> DelayedDeviceClient:
-            client = DelayedDeviceClient()
-            created_clients.append((ip, lang, client))
-            return client
-
-        def discover_client() -> None:
-            try:
-                integration._discover_new_clients(hass, "en", ())
-            except BaseException as err:
-                thread_errors.put(err)
-
-        first_thread = threading.Thread(target=discover_client, daemon=True)
-        second_thread = threading.Thread(target=discover_client, daemon=True)
-        with patch.object(
-            integration, "get_ip", side_effect=discover_address
-        ), patch.object(
+        with patch.object(integration, "get_ip", return_value=["192.0.2.10"]), patch.object(
             integration, "tcp_client", side_effect=create_client
         ):
-            first_thread.start()
-            try:
-                self.assertTrue(first_discovery_started.wait(timeout))
-                second_thread.start()
-                self.assertTrue(second_discovery_waiting.wait(timeout))
-            finally:
-                allow_first_discovery.set()
-                first_thread.join(timeout)
-                if second_thread.ident is not None:
-                    second_thread.join(timeout)
-
-        self.assertTrue(thread_errors.empty())
-        self.assertFalse(first_thread.is_alive())
-        self.assertFalse(second_thread.is_alive())
-        self.assertEqual(get_ip_calls, 2)
-        self.assertEqual(
-            [(ip, lang) for ip, lang, _ in created_clients],
-            [("192.0.2.10", "en")],
-        )
-        self.assertEqual(
-            hass.data[DOMAIN]["tcp_client"], [created_clients[0][2]]
-        )
-        self.assertEqual(notified_clients, [created_clients[0][2]])
-        self.assertEqual(hass.data[DOMAIN]["known_ips"], {"192.0.2.10"})
-
-    def test_one_discovery_batch_deduplicates_addresses(self) -> None:
-        """Duplicate configured and broadcast addresses create one client."""
-        integration = importlib.import_module(
-            "custom_components.hass_cozylife_local_pull"
-        )
-        hass = RecordingHomeAssistant([])
-        created_clients = []
-
-        def create_client(ip: str, lang: str = "en") -> DelayedDeviceClient:
-            client = DelayedDeviceClient()
-            created_clients.append((ip, lang, client))
-            return client
-
-        with patch.object(integration, "tcp_client", side_effect=create_client):
-            integration._add_new_clients(
-                hass,
-                ["192.0.2.10", "192.0.2.10", "192.0.2.10"],
-                "en",
+            integration._discover_new_clients(
+                runtime, "zh", ("192.0.2.10", "192.0.2.10")
             )
 
         self.assertEqual(len(created_clients), 1)
-        self.assertEqual(hass.data[DOMAIN]["ip"], ["192.0.2.10"])
+        self.assertEqual(runtime["ip"], ["192.0.2.10"])
+        self.assertEqual(len(runtime["devices"]), 1)
 
-    def test_client_construction_failure_does_not_block_or_reserve_ips(self) -> None:
-        """A failed address remains retryable without blocking later addresses."""
-        integration = importlib.import_module(
-            "custom_components.hass_cozylife_local_pull"
+    def test_client_construction_failure_keeps_address_retryable(self) -> None:
+        """A failed configured address can succeed during later discovery."""
+        runtime = make_runtime()
+        attempts = 0
+
+        def create_client(ip: str, lang: str) -> DelayedTransport:
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                raise OSError("Injected construction failure")
+            return DelayedTransport(ip, lang, SWITCH_TYPE_CODE)
+
+        with self.assertLogs(integration.__name__, level="ERROR"), patch.object(
+            integration, "tcp_client", side_effect=create_client
+        ):
+            integration._add_new_clients(runtime, ["192.0.2.10"], "en")
+            integration._add_new_clients(runtime, ["192.0.2.10"], "en")
+
+        self.assertEqual(attempts, 2)
+        self.assertEqual(runtime["known_ips"], {"192.0.2.10"})
+        self.assertEqual(len(runtime["devices"]), 1)
+
+    def test_device_callbacks_replay_existing_and_receive_future_devices(self) -> None:
+        """A platform cannot miss devices registered before or after setup."""
+        runtime = make_runtime()
+        first_client = DelayedTransport(
+            device_type_code=LIGHT_TYPE_CODE,
+            device_id="device-first",
         )
-        hass = RecordingHomeAssistant([])
-        attempts = []
-        created_clients = []
-        notified_clients = []
-        integration.register_client_callback(hass, notified_clients.append)
+        integration._register_ready_device(runtime, first_client)
+        notified_devices = []
 
-        def create_client(ip: str, lang: str = "en") -> DelayedDeviceClient:
-            attempts.append(ip)
-            if ip == "192.0.2.10" and attempts.count(ip) == 1:
-                raise RuntimeError("Injected client construction failure")
-            client = DelayedDeviceClient()
-            created_clients.append((ip, lang, client))
-            return client
-
-        try:
-            with self.assertLogs(integration.__name__, level="ERROR"):
-                with patch.object(
-                    integration, "tcp_client", side_effect=create_client
-                ):
-                    integration._add_new_clients(
-                        hass, ["192.0.2.10", "192.0.2.11"], "zh"
-                    )
-                    integration._add_new_clients(hass, ["192.0.2.10"], "zh")
-        except RuntimeError as err:
-            self.fail(f"Client construction failure escaped discovery: {err}")
+        integration.register_device_callback(runtime, notified_devices.append)
+        second_client = DelayedTransport(
+            device_type_code=SWITCH_TYPE_CODE,
+            device_id="device-second",
+        )
+        integration._register_ready_device(runtime, second_client)
 
         self.assertEqual(
-            attempts,
-            ["192.0.2.10", "192.0.2.11", "192.0.2.10"],
-        )
-        self.assertEqual(
-            [(ip, lang) for ip, lang, _ in created_clients],
-            [("192.0.2.11", "zh"), ("192.0.2.10", "zh")],
-        )
-        self.assertEqual(
-            notified_clients,
-            [created_clients[0][2], created_clients[1][2]],
-        )
-        self.assertEqual(
-            hass.data[DOMAIN]["known_ips"],
-            {"192.0.2.10", "192.0.2.11"},
-        )
-        self.assertEqual(
-            hass.data[DOMAIN]["ip"], ["192.0.2.11", "192.0.2.10"]
+            [device.device_id for device in notified_devices],
+            ["device-first", "device-second"],
         )
 
-    def test_callback_replay_failure_does_not_block_later_clients(self) -> None:
-        """One replay failure cannot escape or hide remaining clients."""
-        integration = importlib.import_module(
-            "custom_components.hass_cozylife_local_pull"
+    def test_new_transport_replaces_duplicate_device_identifier(self) -> None:
+        """A new address takes over an existing physical device."""
+        runtime = make_runtime()
+        notified_devices = []
+        integration.register_device_callback(runtime, notified_devices.append)
+        first_client = DelayedTransport(
+            device_type_code=SWITCH_TYPE_CODE,
+            device_id="same-device",
         )
-        first = DelayedDeviceClient()
-        second = DelayedDeviceClient()
-        hass = RecordingHomeAssistant([first, second])
-        replayed_clients = []
-
-        def replay_client(client: DelayedDeviceClient) -> None:
-            if client is first:
-                raise RuntimeError("Injected callback replay failure")
-            replayed_clients.append(client)
-
-        try:
-            with self.assertLogs(integration.__name__, level="ERROR"):
-                integration.register_client_callback(hass, replay_client)
-        except RuntimeError as err:
-            self.fail(f"Client callback failure escaped replay: {err}")
-
-        self.assertEqual(replayed_clients, [second])
-        self.assertIn(
-            replay_client, hass.data[DOMAIN]["client_callbacks"]
+        second_client = DelayedTransport(
+            ip="192.0.2.20",
+            device_type_code=SWITCH_TYPE_CODE,
+            device_id="same-device",
         )
+        received_reports = []
 
-    def test_callback_replay_does_not_hold_integration_lock(self) -> None:
-        """Shutdown can proceed while an existing-client callback is busy."""
-        integration = importlib.import_module(
-            "custom_components.hass_cozylife_local_pull"
-        )
-        hass = RecordingHomeAssistant([DelayedDeviceClient()])
-        callback_started = threading.Event()
-        allow_callback = threading.Event()
-        stop_finished = threading.Event()
-        thread_errors: queue.Queue[BaseException] = queue.Queue()
-        timeout = 5
-
-        def blocking_callback(client: DelayedDeviceClient) -> None:
-            callback_started.set()
-            allow_callback.wait()
-
-        def register_callback() -> None:
-            try:
-                integration.register_client_callback(hass, blocking_callback)
-            except BaseException as err:
-                thread_errors.put(err)
-
-        def stop_integration() -> None:
-            try:
-                integration._close_clients(hass)
-            except BaseException as err:
-                thread_errors.put(err)
-            finally:
-                stop_finished.set()
-
-        registration_thread = threading.Thread(
-            target=register_callback, daemon=True
-        )
-        stop_thread = threading.Thread(target=stop_integration, daemon=True)
-        registration_thread.start()
-        try:
-            self.assertTrue(callback_started.wait(timeout))
-            stop_thread.start()
-            self.assertTrue(stop_finished.wait(timeout))
-            self.assertTrue(hass.data[DOMAIN]["stopped"])
-        finally:
-            allow_callback.set()
-            registration_thread.join(timeout)
-            if stop_thread.ident is not None:
-                stop_thread.join(timeout)
-
-        self.assertTrue(thread_errors.empty())
-        self.assertFalse(registration_thread.is_alive())
-        self.assertFalse(stop_thread.is_alive())
-
-    def test_stop_drains_ready_callback_without_integration_lock(self) -> None:
-        """A readiness callback can access integration state during shutdown."""
-        integration = importlib.import_module(
-            "custom_components.hass_cozylife_local_pull"
-        )
-        client = DelayedDeviceClient(LIGHT_TYPE_CODE)
-        hass = RecordingHomeAssistant([client])
-        callback_started = threading.Event()
-        stop_finished = threading.Event()
-        lock_results = []
-        thread_errors: queue.Queue[BaseException] = queue.Queue()
-        timeout = 5
-
-        def ready_callback(_client: DelayedDeviceClient) -> None:
-            callback_started.set()
-            if not client.stop_signaled.wait(timeout):
-                raise AssertionError("Client stop was not signaled")
-            state_lock = hass.data[DOMAIN]["lock"]
-            acquired = state_lock.acquire(timeout=timeout)
-            lock_results.append(acquired)
-            if acquired:
-                state_lock.release()
-
-        def publish_ready() -> None:
-            try:
-                client.add_ready_callback(ready_callback)
-            except BaseException as err:
-                thread_errors.put(err)
-
-        def stop_integration() -> None:
-            try:
-                integration._close_clients(hass)
-            except BaseException as err:
-                thread_errors.put(err)
-            finally:
-                stop_finished.set()
-
-        callback_thread = threading.Thread(target=publish_ready, daemon=True)
-        stop_thread = threading.Thread(target=stop_integration, daemon=True)
-        try:
-            callback_thread.start()
-            self.assertTrue(callback_started.wait(timeout))
-            stop_thread.start()
-            self.assertTrue(stop_finished.wait(timeout))
-        finally:
-            client.signal_stop()
-            if callback_thread.ident is not None:
-                callback_thread.join(timeout)
-            if stop_thread.ident is not None:
-                stop_thread.join(timeout)
-
-        self.assertTrue(thread_errors.empty())
-        self.assertFalse(callback_thread.is_alive())
-        self.assertFalse(stop_thread.is_alive())
-        self.assertEqual(lock_results, [True])
-
-    def test_stop_signals_all_clients_before_draining_callbacks(self) -> None:
-        """A blocked callback cannot delay another client's stop signal."""
-        integration = importlib.import_module(
-            "custom_components.hass_cozylife_local_pull"
-        )
-        first = DelayedDeviceClient(LIGHT_TYPE_CODE)
-        second = DelayedDeviceClient()
-        hass = RecordingHomeAssistant([first, second])
-        callback_started = threading.Event()
-        allow_callback = threading.Event()
-        stop_finished = threading.Event()
-        thread_errors: queue.Queue[BaseException] = queue.Queue()
-        timeout = 5
-
-        def blocking_callback(_client: DelayedDeviceClient) -> None:
-            callback_started.set()
-            if not allow_callback.wait(timeout):
-                raise TimeoutError("Timed out waiting to release callback")
-
-        def publish_ready() -> None:
-            try:
-                first.add_ready_callback(blocking_callback)
-            except BaseException as err:
-                thread_errors.put(err)
-
-        def stop_integration() -> None:
-            try:
-                integration._close_clients(hass)
-            except BaseException as err:
-                thread_errors.put(err)
-            finally:
-                stop_finished.set()
-
-        callback_thread = threading.Thread(target=publish_ready, daemon=True)
-        stop_thread = threading.Thread(target=stop_integration, daemon=True)
-        callback_thread.start()
-        try:
-            self.assertTrue(callback_started.wait(timeout))
-            stop_thread.start()
-            self.assertTrue(second.stop_signaled.wait(timeout))
-        finally:
-            allow_callback.set()
-            callback_thread.join(timeout)
-            if stop_thread.ident is not None:
-                stop_thread.join(timeout)
-
-        self.assertTrue(thread_errors.empty())
-        self.assertTrue(stop_finished.is_set())
-        self.assertFalse(callback_thread.is_alive())
-        self.assertFalse(stop_thread.is_alive())
-
-    def test_stop_marks_replayed_client_before_callback_dispatch(self) -> None:
-        """Shutdown rejects a replay callback that passed the state check."""
-        integration = importlib.import_module(
-            "custom_components.hass_cozylife_local_pull"
-        )
-        timeout = 5
-        close_started = threading.Event()
-        allow_close = threading.Event()
-        client = BlockingCloseDeviceClient(
-            close_started, allow_close, timeout
-        )
-        hass = RecordingHomeAssistant([client])
-        callback_started = threading.Event()
-        allow_callback = threading.Event()
-        callback_release_timed_out = threading.Event()
-        added_clients = []
-        thread_errors: queue.Queue[BaseException] = queue.Queue()
-
-        def add_ready_client(replayed_client: DelayedDeviceClient) -> None:
-            callback_started.set()
-            if not allow_callback.wait(timeout):
-                callback_release_timed_out.set()
-                raise TimeoutError("Timed out waiting to release replay callback")
-            replayed_client.add_ready_callback(added_clients.append)
-
-        def register_callback() -> None:
-            try:
-                integration.register_client_callback(hass, add_ready_client)
-            except BaseException as err:
-                thread_errors.put(err)
-
-        def stop_integration() -> None:
-            try:
-                integration._close_clients(hass)
-            except BaseException as err:
-                thread_errors.put(err)
-
-        registration_thread = threading.Thread(
-            target=register_callback, daemon=True
-        )
-        stop_thread = threading.Thread(target=stop_integration, daemon=True)
-        registration_thread.start()
-        try:
-            self.assertTrue(callback_started.wait(timeout))
-            stop_thread.start()
-            self.assertTrue(close_started.wait(timeout))
-            allow_callback.set()
-            registration_thread.join(timeout)
-        finally:
-            allow_callback.set()
-            allow_close.set()
-            registration_thread.join(timeout)
-            if stop_thread.ident is not None:
-                stop_thread.join(timeout)
-
-        self.assertTrue(thread_errors.empty())
-        self.assertFalse(registration_thread.is_alive())
-        self.assertFalse(stop_thread.is_alive())
-        self.assertFalse(callback_release_timed_out.is_set())
-        self.assertFalse(client.release_timed_out.is_set())
-        self.assertEqual(added_clients, [])
-
-    def test_notification_failure_does_not_block_callbacks_or_addresses(self) -> None:
-        """One platform failure cannot stop the discovery notification batch."""
-        integration = importlib.import_module(
-            "custom_components.hass_cozylife_local_pull"
-        )
-        hass = RecordingHomeAssistant([])
-        successful_notifications = []
-        created_clients = []
-
-        def fail_notification(client: DelayedDeviceClient) -> None:
-            raise RuntimeError("Injected client notification failure")
-
-        def create_client(ip: str, lang: str = "en") -> DelayedDeviceClient:
-            client = DelayedDeviceClient()
-            created_clients.append((ip, client))
-            return client
-
-        integration.register_client_callback(hass, fail_notification)
-        integration.register_client_callback(
-            hass, successful_notifications.append
-        )
-
-        try:
-            with self.assertLogs(integration.__name__, level="ERROR"):
-                with patch.object(
-                    integration, "tcp_client", side_effect=create_client
-                ):
-                    integration._add_new_clients(
-                        hass, ["192.0.2.10", "192.0.2.11"], "en"
-                    )
-        except RuntimeError as err:
-            self.fail(f"Client callback failure escaped notification: {err}")
-
-        self.assertEqual(
-            successful_notifications,
-            [created_clients[0][1], created_clients[1][1]],
-        )
-        self.assertEqual(
-            hass.data[DOMAIN]["ip"], ["192.0.2.10", "192.0.2.11"]
-        )
-
-    def test_client_notification_does_not_hold_integration_lock(self) -> None:
-        """Shutdown can proceed while a new-client callback is busy."""
-        integration = importlib.import_module(
-            "custom_components.hass_cozylife_local_pull"
-        )
-        hass = RecordingHomeAssistant([])
-        client = DelayedDeviceClient()
-        callback_started = threading.Event()
-        allow_callback = threading.Event()
-        stop_finished = threading.Event()
-        thread_errors: queue.Queue[BaseException] = queue.Queue()
-        timeout = 5
-
-        def blocking_callback(ready_client: DelayedDeviceClient) -> None:
-            callback_started.set()
-            allow_callback.wait()
-
-        def discover_client() -> None:
-            try:
-                integration._add_new_clients(
-                    hass, ["192.0.2.10"], "en"
-                )
-            except BaseException as err:
-                thread_errors.put(err)
-
-        def stop_integration() -> None:
-            try:
-                integration._close_clients(hass)
-            except BaseException as err:
-                thread_errors.put(err)
-            finally:
-                stop_finished.set()
-
-        integration.register_client_callback(hass, blocking_callback)
-        discovery_thread = threading.Thread(target=discover_client, daemon=True)
-        stop_thread = threading.Thread(target=stop_integration, daemon=True)
-        with patch.object(integration, "tcp_client", return_value=client):
-            discovery_thread.start()
-            try:
-                self.assertTrue(callback_started.wait(timeout))
-                stop_thread.start()
-                self.assertTrue(stop_finished.wait(timeout))
-                self.assertTrue(hass.data[DOMAIN]["stopped"])
-            finally:
-                allow_callback.set()
-                discovery_thread.join(timeout)
-                if stop_thread.ident is not None:
-                    stop_thread.join(timeout)
-
-        self.assertTrue(thread_errors.empty())
-        self.assertFalse(discovery_thread.is_alive())
-        self.assertFalse(stop_thread.is_alive())
-        self.assertTrue(client.closed)
-
-    def test_stop_marks_new_client_before_callback_dispatch(self) -> None:
-        """Shutdown rejects a new-client callback past its state check."""
-        integration = importlib.import_module(
-            "custom_components.hass_cozylife_local_pull"
-        )
-        timeout = 5
-        close_started = threading.Event()
-        allow_close = threading.Event()
-        client = BlockingCloseDeviceClient(
-            close_started, allow_close, timeout
-        )
-        hass = RecordingHomeAssistant([])
-        callback_started = threading.Event()
-        allow_callback = threading.Event()
-        callback_release_timed_out = threading.Event()
-        added_clients = []
-        thread_errors: queue.Queue[BaseException] = queue.Queue()
-
-        def add_ready_client(ready_client: DelayedDeviceClient) -> None:
-            callback_started.set()
-            if not allow_callback.wait(timeout):
-                callback_release_timed_out.set()
-                raise TimeoutError("Timed out waiting to release client callback")
-            ready_client.add_ready_callback(added_clients.append)
-
-        integration.register_client_callback(hass, add_ready_client)
-
-        def discover_client() -> None:
-            try:
-                integration._add_new_clients(
-                    hass, ["192.0.2.10"], "en"
-                )
-            except BaseException as err:
-                thread_errors.put(err)
-
-        def stop_integration() -> None:
-            try:
-                integration._close_clients(hass)
-            except BaseException as err:
-                thread_errors.put(err)
-
-        discovery_thread = threading.Thread(target=discover_client, daemon=True)
-        stop_thread = threading.Thread(target=stop_integration, daemon=True)
-        with patch.object(integration, "tcp_client", return_value=client):
-            discovery_thread.start()
-            try:
-                self.assertTrue(callback_started.wait(timeout))
-                stop_thread.start()
-                self.assertTrue(close_started.wait(timeout))
-                allow_callback.set()
-                discovery_thread.join(timeout)
-            finally:
-                allow_callback.set()
-                allow_close.set()
-                discovery_thread.join(timeout)
-                if stop_thread.ident is not None:
-                    stop_thread.join(timeout)
-
-        self.assertTrue(thread_errors.empty())
-        self.assertFalse(discovery_thread.is_alive())
-        self.assertFalse(stop_thread.is_alive())
-        self.assertFalse(callback_release_timed_out.is_set())
-        self.assertFalse(client.release_timed_out.is_set())
-        self.assertEqual(added_clients, [])
-
-    def test_reentrant_stop_skips_remaining_client_callbacks(self) -> None:
-        """A callback-triggered stop prevents later platform notification."""
-        integration = importlib.import_module(
-            "custom_components.hass_cozylife_local_pull"
-        )
-        hass = RecordingHomeAssistant([])
-        later_notifications = []
-        client = DelayedDeviceClient()
-
-        integration.register_client_callback(
-            hass, lambda _client: integration._close_clients(hass)
-        )
-        integration.register_client_callback(hass, later_notifications.append)
-
-        with patch.object(integration, "tcp_client", return_value=client):
-            integration._add_new_clients(hass, ["192.0.2.10"], "en")
-
-        self.assertTrue(client.closed)
-        self.assertEqual(later_notifications, [])
-
-    def test_stopped_integration_rejects_callback_registration(self) -> None:
-        """Shutdown prevents retaining or replaying new platform callbacks."""
-        integration = importlib.import_module(
-            "custom_components.hass_cozylife_local_pull"
-        )
-        client = DelayedDeviceClient()
-        hass = RecordingHomeAssistant([client])
-        replayed_clients = []
-
-        integration._close_clients(hass)
-        integration.register_client_callback(hass, replayed_clients.append)
-
-        self.assertEqual(replayed_clients, [])
-        self.assertEqual(hass.data[DOMAIN]["client_callbacks"], [])
-
-    def test_close_failure_does_not_block_remaining_clients(self) -> None:
-        """One client cleanup failure cannot abort integration shutdown."""
-        integration = importlib.import_module(
-            "custom_components.hass_cozylife_local_pull"
-        )
-
-        class FailingCloseClient(DelayedDeviceClient):
-            def close(self) -> None:
-                raise RuntimeError("Injected client close failure")
-
-        later_client = DelayedDeviceClient()
-        hass = RecordingHomeAssistant(
-            [FailingCloseClient(), later_client]
-        )
-
-        try:
-            with self.assertLogs(integration.__name__, level="ERROR"):
-                integration._close_clients(hass)
-        except RuntimeError as err:
-            self.fail(f"Client close failure escaped shutdown: {err}")
-
-        self.assertTrue(later_client.closed)
-
-    def test_stopped_integration_rejects_late_discovery_results(self) -> None:
-        """An in-flight discovery cannot add clients after lifecycle cleanup."""
-        integration = importlib.import_module(
-            "custom_components.hass_cozylife_local_pull"
-        )
-        hass = RecordingHomeAssistant([])
-        created_clients = []
-
-        integration._close_clients(hass)
         with patch.object(
             integration,
             "tcp_client",
-            side_effect=lambda *args, **kwargs: created_clients.append(
-                DelayedDeviceClient()
-            ),
+            side_effect=[first_client, second_client],
         ):
-            integration._add_new_clients(hass, ["192.0.2.10"], "en")
+            integration._add_new_clients(runtime, [first_client.ip], "en")
+            device = runtime["devices"]["same-device"]
+            remove_callback = device.add_state_callback(
+                lambda state, sequence_number: received_reports.append(
+                    (state, sequence_number)
+                )
+            )
+            integration._add_new_clients(runtime, [second_client.ip], "en")
 
-        self.assertEqual(created_clients, [])
-        self.assertEqual(hass.data[DOMAIN]["tcp_client"], [])
+        first_client.report({"1": 0}, 1700000000001)
+        second_client.report({"1": 255}, 1700000000002)
+        device.query([1])
 
-    def test_stop_waits_for_client_finishing_during_discovery(self) -> None:
-        """Shutdown waits for a client constructed by admitted discovery."""
-        integration = importlib.import_module(
-            "custom_components.hass_cozylife_local_pull"
+        self.assertEqual(len(runtime["devices"]), 1)
+        self.assertIs(runtime["devices"]["same-device"], device)
+        self.assertEqual(notified_devices, [device])
+        self.assertEqual(runtime["tcp_client"], [second_client])
+        self.assertEqual(runtime["ip"], [second_client.ip])
+        self.assertEqual(
+            runtime["known_ips"],
+            {first_client.ip, second_client.ip},
         )
-        hass = RecordingHomeAssistant([])
-        client = DelayedDeviceClient()
-        construction_started = threading.Event()
-        allow_construction = threading.Event()
-        construction_timed_out = threading.Event()
-        stop_waiting = threading.Event()
-        stop_finished = threading.Event()
-        thread_errors: queue.Queue[BaseException] = queue.Queue()
-        timeout = 5
-        hass.data[DOMAIN]["discovery_lock"] = ObservedRLock(stop_waiting)
-
-        def create_client(*args, **kwargs) -> DelayedDeviceClient:
-            construction_started.set()
-            if not allow_construction.wait(timeout * 2):
-                construction_timed_out.set()
-                raise TimeoutError(
-                    "Timed out waiting to release client construction"
-                )
-            return client
-
-        def discover_client() -> None:
-            try:
-                integration._discover_new_clients(
-                    hass, "en", ("192.0.2.10",)
-                )
-            except BaseException as err:
-                thread_errors.put(err)
-
-        def stop_integration() -> None:
-            try:
-                integration._close_clients(hass)
-            except BaseException as err:
-                thread_errors.put(err)
-            finally:
-                stop_finished.set()
-
-        with patch.object(
-            integration, "get_ip", return_value=[]
-        ), patch.object(
-            integration, "tcp_client", side_effect=create_client
-        ):
-            discovery_thread = threading.Thread(
-                target=discover_client, daemon=True
-            )
-            stop_thread = threading.Thread(
-                target=stop_integration, daemon=True
-            )
-            discovery_thread.start()
-            try:
-                self.assertTrue(construction_started.wait(timeout))
-                stop_thread.start()
-                self.assertTrue(stop_waiting.wait(timeout))
-                self.assertFalse(stop_finished.is_set())
-            finally:
-                allow_construction.set()
-                discovery_thread.join(timeout)
-                if stop_thread.ident is not None:
-                    stop_thread.join(timeout)
-
-        self.assertFalse(discovery_thread.is_alive())
-        self.assertFalse(stop_thread.is_alive())
-        self.assertFalse(construction_timed_out.is_set())
-        self.assertTrue(thread_errors.empty())
-        self.assertTrue(stop_finished.is_set())
-        self.assertTrue(client.closed)
-        self.assertEqual(hass.data[DOMAIN]["tcp_client"], [])
-
-    def test_platforms_add_clients_that_become_ready_later(self) -> None:
-        """A delayed handshake adds the entity without reloading its platform."""
-        cases = (
-            (light, LIGHT_TYPE_CODE, light.CozyLifeLight),
-            (switch, SWITCH_TYPE_CODE, switch.CozyLifeSwitch),
-            (switch, MOTOR_TYPE_CODE, motor.CozyLifeMotorSwitch),
-            (number, LIGHT_TYPE_CODE, number.CozyLifeCountdown),
-            (number, MOTOR_TYPE_CODE, motor.CozyLifeMotorCountdown),
+        self.assertTrue(first_client.closed)
+        self.assertFalse(second_client.closed)
+        self.assertEqual(first_client.query_count, 0)
+        self.assertEqual(second_client.query_count, 1)
+        self.assertEqual(
+            received_reports,
+            [({"1": 255}, 1700000000002)],
         )
 
-        for platform, device_type_code, entity_type in cases:
-            with self.subTest(platform=platform.__name__):
-                client = DelayedDeviceClient()
-                hass = RecordingHomeAssistant([client])
-                added_entities = []
+        remove_callback()
+        second_client.report({"1": 0}, 1700000000003)
+        self.assertEqual(
+            received_reports,
+            [({"1": 255}, 1700000000002)],
+        )
 
-                platform.setup_platform(
-                    hass, {}, added_entities.extend, discovery_info={}
-                )
-                self.assertEqual(added_entities, [])
+    def test_callback_failure_does_not_hide_device_from_other_platforms(self) -> None:
+        """One platform callback failure cannot block remaining platforms."""
+        runtime = make_runtime()
+        notified_devices = []
 
-                client.become_ready(device_type_code)
+        def fail_callback(device: CozyLifeDevice) -> None:
+            raise RuntimeError("Injected callback failure")
 
-                self.assertEqual(len(added_entities), 1)
-                self.assertIsInstance(added_entities[0], entity_type)
+        integration.register_device_callback(runtime, fail_callback)
+        integration.register_device_callback(runtime, notified_devices.append)
+        client = DelayedTransport(device_type_code=SWITCH_TYPE_CODE)
 
-    def test_motor_category_is_supported(self) -> None:
-        """Motor metadata is admitted by the integration's category list."""
+        with self.assertLogs(integration.__name__, level="ERROR"):
+            integration._register_ready_device(runtime, client)
+
+        self.assertEqual(notified_devices, [runtime["devices"][client.device_id]])
+
+    def test_stopped_runtime_rejects_callbacks_and_new_addresses(self) -> None:
+        """Shutdown prevents retaining callbacks or constructing transports."""
+        runtime = make_runtime()
+        integration._close_clients(runtime)
+        callback = unittest.mock.Mock()
+
+        integration.register_device_callback(runtime, callback)
+        with patch.object(integration, "tcp_client") as create_client:
+            integration._add_new_clients(runtime, ["192.0.2.10"], "en")
+
+        callback.assert_not_called()
+        create_client.assert_not_called()
+        self.assertEqual(runtime["device_callbacks"], [])
+
+    def test_close_failure_does_not_block_remaining_clients(self) -> None:
+        """One transport cleanup error cannot leave another transport open."""
+        runtime = make_runtime()
+
+        class FailingCloseTransport(DelayedTransport):
+            def close(self) -> None:
+                raise RuntimeError("Injected close failure")
+
+        first = FailingCloseTransport()
+        second = DelayedTransport(ip="192.0.2.20")
+        runtime["tcp_client"] = [first, second]
+
+        with self.assertLogs(integration.__name__, level="ERROR"):
+            integration._close_clients(runtime)
+
+        self.assertTrue(first.stop_signaled)
+        self.assertTrue(second.stop_signaled)
+        self.assertTrue(second.closed)
+
+    def test_motor_category_remains_supported(self) -> None:
+        """The internal device layer preserves motor platform support."""
         self.assertIn(MOTOR_TYPE_CODE, SUPPORT_DEVICE_CATEGORY)
 
-    def test_motor_entities_extend_existing_platform_entities(self) -> None:
-        """Motor behavior specializes the established switch and countdown."""
-        self.assertTrue(
-            issubclass(motor.CozyLifeMotorSwitch, switch.CozyLifeSwitch)
-        )
-        self.assertTrue(
-            issubclass(
-                motor.CozyLifeMotorCountdown,
-                number.CozyLifeCountdown,
-            )
-        )
 
-    def test_motor_platforms_register_specialized_entities(self) -> None:
-        """Motor switch and countdown capabilities use motor-owned classes."""
+class DevicePlatformRegistrationTest(unittest.IsolatedAsyncioTestCase):
+    """Verify platforms map registered device capabilities to entities."""
+
+    async def add_for_platform(
+        self,
+        platform,
+        device_type_code: str,
+        dpids: list[int],
+        *,
+        register_after_setup: bool = False,
+    ) -> list:
+        """Set up one platform and return entities added on the event loop."""
+        runtime = make_runtime()
+        client = DelayedTransport(device_type_code=device_type_code)
+        client.dpid = dpids
+        device = CozyLifeDevice(client)
+        if not register_after_setup:
+            runtime["devices"][device.device_id] = device
+        entry = SimpleNamespace(runtime_data=runtime)
+        added_entities = []
+        hass = SimpleNamespace(loop=asyncio.get_running_loop())
+
+        await platform.async_setup_entry(hass, entry, added_entities.extend)
+        if register_after_setup:
+            integration._register_ready_device(runtime, client)
+        await asyncio.sleep(0)
+        return added_entities
+
+    async def test_platforms_map_all_supported_device_variants(self) -> None:
+        """Every supported type creates its specialized platform entity."""
         cases = (
-            (switch, [1], "CozyLifeMotorSwitch"),
-            (number, [6], "CozyLifeMotorCountdown"),
+            (light, LIGHT_TYPE_CODE, [1, 4], light.CozyLifeLight),
+            (switch, SWITCH_TYPE_CODE, [1, 2], switch.CozyLifeSwitch),
+            (switch, MOTOR_TYPE_CODE, [1, 6], motor.CozyLifeMotorSwitch),
+            (number, LIGHT_TYPE_CODE, [1, 13], number.CozyLifeCountdown),
+            (number, SWITCH_TYPE_CODE, [1, 2], number.CozyLifeCountdown),
+            (number, MOTOR_TYPE_CODE, [1, 6], motor.CozyLifeMotorCountdown),
         )
 
-        for platform, dpid, expected_class_name in cases:
-            with self.subTest(platform=platform.__name__):
-                client = DelayedDeviceClient(MOTOR_TYPE_CODE)
-                client.dpid = dpid
-                hass = RecordingHomeAssistant([client])
-                added_entities = []
-
-                platform.setup_platform(
-                    hass, {}, added_entities.extend, discovery_info={}
+        for platform, device_type_code, dpids, entity_type in cases:
+            with self.subTest(platform=platform.__name__, type=device_type_code):
+                entities = await self.add_for_platform(
+                    platform, device_type_code, dpids
                 )
+                self.assertEqual(len(entities), 1)
+                self.assertIsInstance(entities[0], entity_type)
+                self.assertEqual(entities[0].device_info["identifiers"], {
+                    (DOMAIN, "device-192.0.2.10")
+                })
 
-                self.assertEqual(len(added_entities), 1)
-                entity_type = type(added_entities[0])
+    async def test_loaded_platform_receives_device_registered_later(self) -> None:
+        """A configured address that comes online later still creates an entity."""
+        entities = await self.add_for_platform(
+            light,
+            LIGHT_TYPE_CODE,
+            [1, 4],
+            register_after_setup=True,
+        )
+
+        self.assertEqual(len(entities), 1)
+        self.assertIsInstance(entities[0], light.CozyLifeLight)
+
+    async def test_network_thread_registers_entity_on_home_assistant_loop(
+        self,
+    ) -> None:
+        """A network-thread handshake queues entity creation on the event loop."""
+        runtime = make_runtime()
+        client = DelayedTransport()
+        with patch.object(integration, "tcp_client", return_value=client):
+            integration._add_new_clients(runtime, [client.ip], "en")
+
+        entities = []
+        callback_thread_ids = []
+        event_loop_thread_id = threading.get_ident()
+        entry = SimpleNamespace(runtime_data=runtime)
+        hass = SimpleNamespace(loop=asyncio.get_running_loop())
+
+        def add_entities(new_entities) -> None:
+            callback_thread_ids.append(threading.get_ident())
+            entities.extend(new_entities)
+
+        def publish_readiness() -> int:
+            client.become_ready(LIGHT_TYPE_CODE)
+            return threading.get_ident()
+
+        await light.async_setup_entry(hass, entry, add_entities)
+        worker_thread_id = await asyncio.to_thread(publish_readiness)
+        await asyncio.sleep(0)
+
+        self.assertNotEqual(worker_thread_id, event_loop_thread_id)
+        self.assertEqual(callback_thread_ids, [event_loop_thread_id])
+        self.assertEqual(len(entities), 1)
+        self.assertIsInstance(entities[0], light.CozyLifeLight)
+
+    async def test_platforms_ignore_mismatched_types_and_capabilities(self) -> None:
+        """Unsupported type and countdown combinations create no entities."""
+        cases = (
+            (light, SWITCH_TYPE_CODE, [1, 2]),
+            (switch, LIGHT_TYPE_CODE, [1, 4]),
+            (number, LIGHT_TYPE_CODE, [1, 2]),
+            (number, SWITCH_TYPE_CODE, [1, 13]),
+            (number, MOTOR_TYPE_CODE, [1, 2]),
+            (number, "99", [1, 2, 6, 13]),
+        )
+
+        for platform, device_type_code, dpids in cases:
+            with self.subTest(platform=platform.__name__, type=device_type_code):
                 self.assertEqual(
-                    entity_type.__module__,
-                    "custom_components.hass_cozylife_local_pull.motor",
+                    await self.add_for_platform(platform, device_type_code, dpids),
+                    [],
                 )
-                self.assertEqual(entity_type.__name__, expected_class_name)
 
-                client.dpid = [2]
-                added_entities.clear()
-                platform.setup_platform(
-                    hass, {}, added_entities.extend, discovery_info={}
-                )
-                self.assertEqual(added_entities, [])
-
-    def test_platforms_register_callbacks_for_already_ready_clients(self) -> None:
-        """A handshake completed before platform setup cannot be missed."""
+    async def test_countdown_platform_uses_expected_data_point(self) -> None:
+        """Each device category binds countdown to its protocol data point."""
         cases = (
-            (light, LIGHT_TYPE_CODE, light.CozyLifeLight),
-            (switch, SWITCH_TYPE_CODE, switch.CozyLifeSwitch),
-            (switch, MOTOR_TYPE_CODE, motor.CozyLifeMotorSwitch),
-            (number, LIGHT_TYPE_CODE, number.CozyLifeCountdown),
-            (number, MOTOR_TYPE_CODE, motor.CozyLifeMotorCountdown),
+            (LIGHT_TYPE_CODE, [1, 13], "13"),
+            (SWITCH_TYPE_CODE, [1, 2], "2"),
+            (MOTOR_TYPE_CODE, [1, 6], "6"),
         )
 
-        for platform, device_type_code, entity_type in cases:
-            with self.subTest(platform=platform.__name__):
-                client = DelayedDeviceClient(device_type_code)
-                hass = RecordingHomeAssistant([client])
-                added_entities = []
-
-                platform.setup_platform(
-                    hass, {}, added_entities.extend, discovery_info={}
+        for device_type_code, dpids, expected_dp_id in cases:
+            with self.subTest(type=device_type_code):
+                entities = await self.add_for_platform(
+                    number, device_type_code, dpids
                 )
-
-                self.assertEqual(client.registration_count, 1)
-                self.assertEqual(len(added_entities), 1)
-                self.assertIsInstance(added_entities[0], entity_type)
-
-    def test_platforms_subscribe_to_clients_discovered_later(self) -> None:
-        """Loaded platforms attach readiness callbacks to future clients."""
-        cases = (
-            (light, LIGHT_TYPE_CODE, light.CozyLifeLight),
-            (switch, SWITCH_TYPE_CODE, switch.CozyLifeSwitch),
-            (switch, MOTOR_TYPE_CODE, motor.CozyLifeMotorSwitch),
-            (number, LIGHT_TYPE_CODE, number.CozyLifeCountdown),
-            (number, MOTOR_TYPE_CODE, motor.CozyLifeMotorCountdown),
-        )
-
-        for platform, device_type_code, entity_type in cases:
-            with self.subTest(platform=platform.__name__):
-                hass = RecordingHomeAssistant([])
-                added_entities = []
-
-                platform.setup_platform(
-                    hass, {}, added_entities.extend, discovery_info={}
-                )
-
-                callbacks = hass.data[DOMAIN]["client_callbacks"]
-                self.assertEqual(len(callbacks), 1)
-                client = DelayedDeviceClient()
-                callbacks[0](client)
-                client.become_ready(device_type_code)
-
-                self.assertEqual(len(added_entities), 1)
-                self.assertIsInstance(added_entities[0], entity_type)
-
-    def test_platforms_ignore_ready_clients_for_another_device_type(self) -> None:
-        """A readiness callback preserves each platform's type boundary."""
-        cases = (
-            (light, SWITCH_TYPE_CODE),
-            (switch, LIGHT_TYPE_CODE),
-            (number, "99"),
-        )
-
-        for platform, device_type_code in cases:
-            with self.subTest(platform=platform.__name__):
-                client = DelayedDeviceClient(device_type_code)
-                hass = RecordingHomeAssistant([client])
-                added_entities = []
-
-                platform.setup_platform(
-                    hass, {}, added_entities.extend, discovery_info={}
-                )
-
-                self.assertEqual(client.registration_count, 1)
-                self.assertEqual(added_entities, [])
-
-    def test_countdown_platform_adds_each_supported_device_dpid(self) -> None:
-        """Each supported device type creates its matching countdown entity."""
-        cases = (
-            (LIGHT_TYPE_CODE, [1, 13], "13", "Countdown"),
-            (SWITCH_TYPE_CODE, [1, 2], "2", "Countdown 1"),
-            (MOTOR_TYPE_CODE, [1, 6], "6", "Countdown"),
-        )
-
-        for device_type_code, dpid, expected_dp_id, label_suffix in cases:
-            with self.subTest(device_type_code=device_type_code):
-                client = DelayedDeviceClient(device_type_code)
-                client.dpid = dpid
-                hass = RecordingHomeAssistant([client])
-                added_entities = []
-
-                number.setup_platform(
-                    hass, {}, added_entities.extend, discovery_info={}
-                )
-
-                self.assertEqual(client.registration_count, 1)
-                self.assertEqual(len(added_entities), 1)
-                entity = added_entities[0]
-                self.assertIsInstance(entity, number.CozyLifeCountdown)
-                self.assertEqual(entity._dp_id, expected_dp_id)
-                self.assertTrue(entity.name.endswith(label_suffix))
-
-    def test_countdown_platform_rejects_mismatched_capabilities(self) -> None:
-        """Unknown types and mismatched DPIDs create no countdown entity."""
-        cases = (
-            (LIGHT_TYPE_CODE, [1, 2]),
-            (SWITCH_TYPE_CODE, [1, 13]),
-            (MOTOR_TYPE_CODE, [1, 2]),
-            ("99", [1, 2, 6, 13]),
-        )
-
-        for device_type_code, dpid in cases:
-            with self.subTest(device_type_code=device_type_code, dpid=dpid):
-                client = DelayedDeviceClient(device_type_code)
-                client.dpid = dpid
-                hass = RecordingHomeAssistant([client])
-                added_entities = []
-
-                number.setup_platform(
-                    hass, {}, added_entities.extend, discovery_info={}
-                )
-
-                self.assertEqual(client.registration_count, 1)
-                self.assertEqual(added_entities, [])
+                self.assertEqual(entities[0]._dp_id, expected_dp_id)
